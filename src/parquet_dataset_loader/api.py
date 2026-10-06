@@ -1,0 +1,239 @@
+"""High-level user-facing API matching Hugging Face datasets conventions.
+
+This module exposes:
+- load_dataset(): Universal loader for remote Hugging Face and local Parquet datasets.
+- load_from_disk(): Re-loader for datasets previously saved via save_to_disk().
+"""
+
+from __future__ import annotations
+
+import os
+from typing import (
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Union,
+)
+
+import pyarrow as pa
+import pyarrow.feather as feather
+import pyarrow.parquet as pq
+
+from parquet_dataset_loader.cache import DiskCache, RowGroupMemoryCache
+from parquet_dataset_loader.dataset import IndexedParquetDataset, ParquetDatasetDict
+from parquet_dataset_loader.exceptions import (
+    DatasetNotFoundError,
+    ParquetDatasetError,
+    SplitNotFoundError,
+)
+from parquet_dataset_loader.hf_resolver import (
+    infer_split_name,
+    parse_split_slice,
+    resolve_parquet_dataset,
+)
+from parquet_dataset_loader.index import build_metadata_index
+from parquet_dataset_loader.reader import RowGroupReader, download_parquet_files
+
+DEFAULT_CACHE_DIR = os.path.expanduser("~/.cache/parquet_dataset_loader")
+
+
+def load_dataset(
+    path: Union[str, Sequence[str], Mapping[str, Union[str, Sequence[str]]]],
+    name: Optional[str] = None,
+    data_dir: Optional[str] = None,
+    data_files: Optional[Union[str, Sequence[str], Mapping[str, Union[str, Sequence[str]]]]] = None,
+    split: Optional[str] = None,
+    cache_dir: Optional[str] = None,
+    streaming: bool = False,
+    columns: Optional[Sequence[str]] = None,
+    token: Optional[Union[bool, str]] = None,
+    revision: Optional[str] = None,
+    max_cached_row_groups: int = 2,
+    disk_cache: bool = False,
+    max_workers: int = 16,
+    show_progress: bool = False,
+    **kwargs: Any,
+) -> Union[IndexedParquetDataset, ParquetDatasetDict]:
+    """Load a Parquet dataset from Hugging Face Hub, local files, or remote URLs.
+
+    Provides a drop-in replacement for `datasets.load_dataset` with high-performance
+    metadata indexing and random-access streaming.
+
+    Args:
+        path: Hugging Face repo ID (e.g. 'KhangTruong/COCO-inpainted'), local path,
+            directory, direct Parquet URL, or list/mapping of files.
+        name: Optional dataset configuration name.
+        data_dir: Subdirectory within the dataset repository.
+        data_files: Specific file or files override (glob, list, or dict).
+        split: Specific split to load (e.g. 'train', 'validation', or sliced
+            like 'train[:1000]'), or None to load all splits.
+        cache_dir: Directory for caching metadata indices, row groups, or full files.
+            Defaults to ~/.cache/parquet_dataset_loader.
+        streaming: If True, uses random-access streaming without downloading full
+            parquet files to disk. If False, downloads files to disk and opens them locally.
+        columns: Optional column projection list. Only these columns will be transferred
+            or decoded, dramatically saving bandwidth and memory.
+        token: Hugging Face auth token, or True to use stored credentials.
+        revision: Specific git revision, branch, or tag (default 'main').
+        max_cached_row_groups: Number of decoded row groups to retain in RAM simultaneously.
+        disk_cache: Whether to cache fetched row groups to local disk during streaming.
+        max_workers: Concurrency level for metadata indexing or file downloads.
+        show_progress: Whether to show progress bars.
+        **kwargs: Additional parameters for forward compatibility.
+
+    Returns:
+        An IndexedParquetDataset if a single split was requested, or a
+        ParquetDatasetDict if split was None.
+
+    Raises:
+        DatasetNotFoundError: If the repository or files cannot be located.
+        SplitNotFoundError: If the requested split does not exist.
+        IndexOutOfBoundsError: If slice indices exceed the split bounds.
+    """
+    resolved_cache_dir = os.path.abspath(os.path.expanduser(cache_dir or DEFAULT_CACHE_DIR))
+    os.makedirs(resolved_cache_dir, exist_ok=True)
+
+    # Parse potential split slicing (e.g. 'train[:1000]')
+    base_split, slice_obj = parse_split_slice(split)
+
+    # Resolve all files for each split
+    splits_map = resolve_parquet_dataset(
+        path=path,
+        name=name,
+        split=base_split,
+        data_files=data_files,
+        token=token,
+        revision=revision,
+    )
+
+    if base_split and base_split not in splits_map:
+        raise SplitNotFoundError(base_split, list(splits_map.keys()))
+
+    target_splits = [base_split] if base_split else list(splits_map.keys())
+
+    # Mode 1: Non-streaming (download full parquet files to disk if remote)
+    if not streaming:
+        downloaded_splits_map: Dict[str, List[str]] = {}
+        for s in target_splits:
+            urls = splits_map[s]
+            remote_urls = [u for u in urls if u.startswith(("http://", "https://"))]
+            if remote_urls:
+                safe_repo_name = (
+                    str(path).replace("/", "_").replace(":", "_") if isinstance(path, str) else "dataset"
+                )
+                split_dl_dir = os.path.join(resolved_cache_dir, "downloads", safe_repo_name, s)
+                local_files = download_parquet_files(
+                    urls=urls,
+                    target_dir=split_dl_dir,
+                    token=str(token) if isinstance(token, str) else None,
+                    max_workers=max_workers,
+                    show_progress=show_progress,
+                )
+                downloaded_splits_map[s] = local_files
+            else:
+                downloaded_splits_map[s] = urls
+        splits_map = downloaded_splits_map
+
+    # Build datasets for target splits
+    datasets: Dict[str, IndexedParquetDataset] = {}
+
+    for s in target_splits:
+        file_list = splits_map[s]
+
+        # Build / retrieve cached metadata index
+        index = build_metadata_index(
+            files=file_list,
+            split_name=s,
+            cache_dir=resolved_cache_dir,
+            max_workers=max_workers,
+            token=str(token) if isinstance(token, str) else None,
+        )
+
+        mem_cache = RowGroupMemoryCache(max_entries=max_cached_row_groups)
+        d_cache = DiskCache(resolved_cache_dir) if disk_cache else None
+
+        reader = RowGroupReader(
+            memory_cache=mem_cache,
+            disk_cache=d_cache,
+            token=str(token) if isinstance(token, str) else None,
+        )
+
+        ds = IndexedParquetDataset(
+            index=index,
+            reader=reader,
+            columns=columns,
+            split=s,
+        )
+
+        # Apply split slice if requested (e.g. 'train[:1000]')
+        if slice_obj is not None:
+            start = slice_obj.start or 0
+            stop = slice_obj.stop if slice_obj.stop is not None else len(ds)
+            length = max(0, stop - start)
+            ds = ds.slice(start, length)
+
+        datasets[s] = ds
+
+    if base_split is not None:
+        return datasets[base_split]
+
+    return ParquetDatasetDict(datasets)
+
+
+def load_from_disk(
+    dataset_path: str,
+    columns: Optional[Sequence[str]] = None,
+) -> Union[IndexedParquetDataset, ParquetDatasetDict]:
+    """Load a dataset previously saved to disk via save_to_disk().
+
+    Args:
+        dataset_path: Path to the directory containing saved dataset files.
+        columns: Optional column projection list.
+
+    Returns:
+        IndexedParquetDataset or ParquetDatasetDict.
+    """
+    abs_path = os.path.abspath(os.path.expanduser(dataset_path))
+    if not os.path.exists(abs_path):
+        raise DatasetNotFoundError(dataset_path, "Local path does not exist.")
+
+    # Check if single split or multiple splits
+    entries = os.listdir(abs_path)
+    subdirs = [e for e in entries if os.path.isdir(os.path.join(abs_path, e))]
+
+    if subdirs and any(os.path.exists(os.path.join(abs_path, d, f"{d}.feather")) for d in subdirs):
+        # Multiple splits
+        splits_dict: Dict[str, IndexedParquetDataset] = {}
+        for d in sorted(subdirs):
+            split_dir = os.path.join(abs_path, d)
+            splits_dict[d] = load_from_disk(split_dir, columns=columns)  # type: ignore
+        return ParquetDatasetDict(splits_dict)
+
+    # Single split
+    # Look for .feather or .parquet files
+    data_files = [f for f in entries if f.endswith((".feather", ".parquet", ".pq"))]
+    if not data_files:
+        raise DatasetNotFoundError(dataset_path, "No data files found in saved directory.")
+
+    first_file = os.path.join(abs_path, data_files[0])
+    split_name = infer_split_name(first_file)
+
+    if first_file.endswith(".feather"):
+        # Load via feather
+        table = feather.read_table(first_file, columns=list(columns) if columns else None, memory_map=True)
+        # Create a local in-memory/feather IndexedParquetDataset or return HF dataset
+        # To maintain exact interface, write out a fast parquet or construct index:
+        tmp_parquet = os.path.join(abs_path, f"{split_name}.parquet")
+        if not os.path.exists(tmp_parquet):
+            pq.write_table(table, tmp_parquet, compression="snappy")
+        first_file = tmp_parquet
+
+    return load_dataset(
+        path=first_file,
+        split=split_name,
+        streaming=False,
+        columns=columns,
+    )
