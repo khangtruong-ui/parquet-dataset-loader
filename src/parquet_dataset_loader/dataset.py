@@ -70,11 +70,13 @@ class IndexedParquetDataset(collections.abc.Sequence):
         offset: int = 0,
         length: Optional[int] = None,
         split: Optional[str] = None,
+        background_downloader: Optional[Any] = None,
     ) -> None:
         self.index = index
         self.reader = reader
         self.columns = list(columns) if columns is not None else None
         self.offset = max(0, offset)
+        self.background_downloader = background_downloader
 
         max_len = max(0, self.index.total_rows - self.offset)
         self._length = max_len if length is None else max(0, min(length, max_len))
@@ -112,6 +114,7 @@ class IndexedParquetDataset(collections.abc.Sequence):
             file_url=rg_info.file_url,
             rg_index=rg_info.rg_index,
             columns=self.columns,
+            file_index=rg_info.file_index,
         )
 
         # Slice 1 row and extract as dictionary
@@ -297,6 +300,7 @@ class IndexedParquetDataset(collections.abc.Sequence):
                 file_url=rg_info.file_url,
                 rg_index=rg_info.rg_index,
                 columns=self.columns,
+                file_index=rg_info.file_index,
             )
             sub_table = table.slice(local_start, local_stop - local_start)
             batches.extend(sub_table.to_batches())
@@ -304,6 +308,69 @@ class IndexedParquetDataset(collections.abc.Sequence):
         if not batches:
             return pa.Table.from_batches([], schema=self._schema)
         return pa.Table.from_batches(batches, schema=self._schema)
+
+    @property
+    def progressive_saver(self) -> Optional[Any]:
+        """Access the ProgressiveDiskSaver instance if configured."""
+        return self.reader.progressive_saver
+
+    @property
+    def save_progress(self) -> float:
+        """Fraction of total row groups saved to disk (0.0 to 1.0)."""
+        if self.progressive_saver is not None:
+            return self.progressive_saver.save_progress
+        return 0.0
+
+    @property
+    def is_fully_saved(self) -> bool:
+        """Whether all row groups in this dataset are saved to disk."""
+        if self.progressive_saver is not None:
+            return self.progressive_saver.is_complete
+        return False
+
+    def stream_and_save(self, show_progress: bool = True) -> IndexedParquetDataset:
+        """Stream through the entire dataset, saving all row groups to disk.
+
+        Enables users to stream data with zero initial blocking while simultaneously
+        writing the entire dataset to disk.
+
+        Args:
+            show_progress: Whether to show a tqdm progress bar.
+
+        Returns:
+            self
+        """
+        from tqdm import tqdm
+
+        pbar = (
+            tqdm(total=len(self), desc=f"Streaming & saving {self.split}", unit="row")
+            if show_progress
+            else None
+        )
+
+        for rg_info in self.index.row_groups:
+            self.reader.read_row_group(
+                file_url=rg_info.file_url,
+                rg_index=rg_info.rg_index,
+                columns=self.columns,
+                file_index=rg_info.file_index,
+            )
+            if pbar:
+                pbar.update(rg_info.num_rows)
+
+        if pbar:
+            pbar.close()
+
+        if self.progressive_saver is not None:
+            self.progressive_saver.finalize(self.index)
+
+        return self
+
+    def close(self) -> None:
+        """Stop any background downloader and close open reader handles."""
+        if self.background_downloader is not None:
+            self.background_downloader.stop()
+        self.reader.close()
 
     def to_pandas(self) -> Any:
         """Materialize this dataset view as a pandas DataFrame."""

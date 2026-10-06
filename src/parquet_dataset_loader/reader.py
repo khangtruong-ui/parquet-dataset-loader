@@ -39,6 +39,7 @@ class RowGroupReader:
         self,
         memory_cache: Optional[RowGroupMemoryCache] = None,
         disk_cache: Optional[DiskCache] = None,
+        progressive_saver: Optional[Any] = None,
         token: Optional[str] = None,
         block_size: int = 2 * 1024 * 1024,  # 2 MB default block size
         max_open_files: int = 8,
@@ -47,6 +48,7 @@ class RowGroupReader:
             memory_cache if memory_cache is not None else RowGroupMemoryCache(max_entries=2)
         )
         self.disk_cache = disk_cache
+        self.progressive_saver = progressive_saver
         self.token = token
         self.block_size = block_size
         self.max_open_files = max_open_files
@@ -90,13 +92,15 @@ class RowGroupReader:
         file_url: str,
         rg_index: int,
         columns: Optional[Sequence[str]] = None,
+        file_index: int = 0,
     ) -> pa.Table:
-        """Read a single row group table, checking memory and disk caches first.
+        """Read a single row group table, checking memory, progressive, and disk caches first.
 
         Args:
             file_url: URL or local path to the Parquet file.
             rg_index: Row group index within the file.
             columns: Optional subset of columns to read.
+            file_index: Index of the file within the dataset split (for progressive saving).
 
         Returns:
             Decoded PyArrow Table containing the rows of this row group.
@@ -109,14 +113,21 @@ class RowGroupReader:
         if cached is not None:
             return cached
 
-        # 2. Check disk cache if configured
+        # 2. Check progressive disk saver if configured
+        if self.progressive_saver is not None:
+            cached_prog = self.progressive_saver.get(file_index, rg_index, columns)
+            if cached_prog is not None:
+                self.memory_cache.put(file_url, rg_index, cached_prog, columns)
+                return cached_prog
+
+        # 3. Check disk cache if configured
         if self.disk_cache is not None:
             cached_disk = self.disk_cache.get(file_url, rg_index, columns)
             if cached_disk is not None:
                 self.memory_cache.put(file_url, rg_index, cached_disk, columns)
                 return cached_disk
 
-        # 3. Read from source (remote HTTP range request or local disk)
+        # 4. Read from source (remote HTTP range request or local disk)
         try:
             pf = self._get_parquet_file(file_url)
             table = pf.read_row_group(rg_index, columns=list(columns) if columns else None)
@@ -125,11 +136,15 @@ class RowGroupReader:
                 file_url, f"Failed reading row group {rg_index}: {e}"
             ) from e
 
-        # 4. Save to disk cache if configured
+        # 5. Save to progressive disk saver if configured
+        if self.progressive_saver is not None:
+            self.progressive_saver.save(file_index, rg_index, table, columns)
+
+        # 6. Save to disk cache if configured
         if self.disk_cache is not None:
             self.disk_cache.put(file_url, rg_index, table, columns)
 
-        # 5. Save to memory cache
+        # 7. Save to memory cache
         self.memory_cache.put(file_url, rg_index, table, columns)
 
         return table

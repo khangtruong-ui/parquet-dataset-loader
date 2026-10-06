@@ -27,9 +27,10 @@ from parquet_dataset_loader.index import (
     RowGroupInfo,
     build_metadata_index,
 )
+from parquet_dataset_loader.progressive import BackgroundDownloader, ProgressiveDiskSaver
 from parquet_dataset_loader.reader import RowGroupReader, download_parquet_files
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "__version__",
     "load_dataset",
@@ -41,6 +42,8 @@ __all__ = [
     "RowGroupInfo",
     "RowGroupMemoryCache",
     "DiskCache",
+    "ProgressiveDiskSaver",
+    "BackgroundDownloader",
     "RowGroupReader",
     "download_parquet_files",
     "build_metadata_index",

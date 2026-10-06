@@ -35,6 +35,7 @@ from parquet_dataset_loader.hf_resolver import (
     resolve_parquet_dataset,
 )
 from parquet_dataset_loader.index import build_metadata_index
+from parquet_dataset_loader.progressive import BackgroundDownloader, ProgressiveDiskSaver
 from parquet_dataset_loader.reader import RowGroupReader, download_parquet_files
 
 DEFAULT_CACHE_DIR = os.path.expanduser("~/.cache/parquet_dataset_loader")
@@ -48,6 +49,8 @@ def load_dataset(
     split: Optional[str] = None,
     cache_dir: Optional[str] = None,
     streaming: bool = False,
+    save_to_disk: Optional[Union[bool, str]] = None,
+    background_download: bool = False,
     columns: Optional[Sequence[str]] = None,
     token: Optional[Union[bool, str]] = None,
     revision: Optional[str] = None,
@@ -60,7 +63,7 @@ def load_dataset(
     """Load a Parquet dataset from Hugging Face Hub, local files, or remote URLs.
 
     Provides a drop-in replacement for `datasets.load_dataset` with high-performance
-    metadata indexing and random-access streaming.
+    metadata indexing, random-access streaming, and simultaneous progressive disk persistence.
 
     Args:
         path: Hugging Face repo ID (e.g. 'KhangTruong/COCO-inpainted'), local path,
@@ -74,6 +77,10 @@ def load_dataset(
             Defaults to ~/.cache/parquet_dataset_loader.
         streaming: If True, uses random-access streaming without downloading full
             parquet files to disk. If False, downloads files to disk and opens them locally.
+        save_to_disk: If provided (path string or True), streams immediately with zero
+            initial wait while progressively saving fetched row groups to disk simultaneously.
+        background_download: If True and save_to_disk is enabled, downloads remaining
+            row groups in a background worker thread while foreground streams unblocked.
         columns: Optional column projection list. Only these columns will be transferred
             or decoded, dramatically saving bandwidth and memory.
         token: Hugging Face auth token, or True to use stored credentials.
@@ -113,6 +120,11 @@ def load_dataset(
         raise SplitNotFoundError(base_split, list(splits_map.keys()))
 
     target_splits = [base_split] if base_split else list(splits_map.keys())
+
+    # If save_to_disk is requested, automatically switch to streaming=True
+    # so we never block upfront downloading full files!
+    if save_to_disk is not None:
+        streaming = True
 
     # Mode 1: Non-streaming (download full parquet files to disk if remote)
     if not streaming:
@@ -155,17 +167,50 @@ def load_dataset(
         mem_cache = RowGroupMemoryCache(max_entries=max_cached_row_groups)
         d_cache = DiskCache(resolved_cache_dir) if disk_cache else None
 
+        # Setup progressive save-to-disk if requested
+        prog_saver: Optional[ProgressiveDiskSaver] = None
+        if save_to_disk is not None:
+            if isinstance(save_to_disk, str):
+                base_save_dir = os.path.abspath(os.path.expanduser(save_to_disk))
+            else:
+                safe_repo_name = (
+                    str(path).replace("/", "_").replace(":", "_") if isinstance(path, str) else "dataset"
+                )
+                base_save_dir = os.path.join(resolved_cache_dir, "saved", safe_repo_name)
+
+            split_save_dir = (
+                os.path.join(base_save_dir, s) if base_split is None else base_save_dir
+            )
+            prog_saver = ProgressiveDiskSaver(
+                target_dir=split_save_dir,
+                split_name=s,
+                total_row_groups=len(index.row_groups),
+                schema=index.schema,
+            )
+
         reader = RowGroupReader(
             memory_cache=mem_cache,
             disk_cache=d_cache,
+            progressive_saver=prog_saver,
             token=str(token) if isinstance(token, str) else None,
         )
+
+        bg_downloader: Optional[BackgroundDownloader] = None
+        if background_download and prog_saver is not None:
+            bg_downloader = BackgroundDownloader(
+                reader=reader,
+                row_groups=index.row_groups,
+                progressive_saver=prog_saver,
+                columns=columns,
+            )
+            bg_downloader.start()
 
         ds = IndexedParquetDataset(
             index=index,
             reader=reader,
             columns=columns,
             split=s,
+            background_downloader=bg_downloader,
         )
 
         # Apply split slice if requested (e.g. 'train[:1000]')
@@ -211,6 +256,37 @@ def load_from_disk(
             split_dir = os.path.join(abs_path, d)
             splits_dict[d] = load_from_disk(split_dir, columns=columns)  # type: ignore
         return ParquetDatasetDict(splits_dict)
+
+    # Check if this is a progressive save directory with row_groups/
+    rg_dir = os.path.join(abs_path, "row_groups")
+    if os.path.exists(rg_dir):
+        rg_files = []
+        for root, _, files in os.walk(rg_dir):
+            for f in sorted(files):
+                if f.endswith(".feather"):
+                    rg_files.append(os.path.join(root, f))
+        if rg_files:
+            batches = []
+            for rgf in rg_files:
+                tbl = feather.read_table(
+                    rgf, columns=list(columns) if columns else None, memory_map=True
+                )
+                batches.extend(tbl.to_batches())
+            table = pa.Table.from_batches(batches)
+            manifest_files = [f for f in entries if f.endswith("_manifest.json")]
+            split_name = (
+                manifest_files[0].replace("_manifest.json", "")
+                if manifest_files
+                else "train"
+            )
+            tmp_parquet = os.path.join(abs_path, f"{split_name}.parquet")
+            pq.write_table(table, tmp_parquet, compression="snappy")
+            return load_dataset(
+                path=tmp_parquet,
+                split=split_name,
+                streaming=False,
+                columns=columns,
+            )
 
     # Single split
     # Look for .feather or .parquet files

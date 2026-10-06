@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-10-06
+
+### Added
+- **Simultaneous Streaming + Save-to-Disk**:
+  - `save_to_disk` parameter in `load_dataset`: allows callers to start streaming immediately with zero initial wait time (unblocked step 0), while progressively persisting accessed row groups to local disk in Feather format.
+  - `ProgressiveDiskSaver`: thread-safe manager maintaining an atomic manifest of saved row groups on disk, enabling seamless resuming and offline usage.
+  - `BackgroundDownloader`: optional background worker thread (`background_download=True`) that prefetches and archives remaining row groups asynchronously while foreground iteration proceeds unblocked.
+  - `ds.stream_and_save()`: streams through the entire dataset with optional progress bar, ensuring all row groups are persisted to disk.
+  - `ds.save_progress` and `ds.is_fully_saved` monitoring properties on `IndexedParquetDataset`.
+  - Full compatibility in `load_from_disk()` to reload progressively saved dataset directories.
+  - New example `examples/streaming_and_saving.py` demonstrating zero-wait streaming while archiving to disk.
+  - Dedicated unit tests in `tests/test_progressive.py`.
+
 ## [0.1.0] - 2026-10-06
 
 ### Added

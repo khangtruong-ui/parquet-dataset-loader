@@ -203,6 +203,41 @@ reloaded = pdl.load_from_disk("./my_local_data")
 print(len(reloaded))  # 500
 ```
 
+### 8. Streaming + Save to Disk Simultaneously (Zero Initial Wait)
+
+If you want a local copy on disk, standard Hugging Face `load_dataset("...", streaming=False)` forces you to wait for the entire 62 GB download before you can access a single sample.
+
+With `parquet-dataset-loader`, pass `save_to_disk="./my_archive"`:
+- **Instant access**: Step 0 starts in <0.5 seconds without waiting!
+- **Simultaneous saving**: Each row group is saved to disk as it is streamed.
+- **Background prefetching** (optional): Set `background_download=True` to download remaining row groups in a background worker thread while you process data unblocked.
+
+```python
+# Start streaming immediately while saving to disk in parallel
+ds = pdl.load_dataset(
+    "KhangTruong/COCO-inpainted",
+    split="train",
+    streaming=True,
+    save_to_disk="./coco_archive",
+    columns=["mask"],
+    background_download=True,  # Prefetches remaining row groups in the background
+)
+
+# Access row 0 instantly without waiting for download!
+sample_0 = ds[0]
+
+# Check progress anytime:
+print(f"Disk save progress: {ds.save_progress * 100:.1f}%")
+print(f"Is fully saved: {ds.is_fully_saved}")
+
+# Stream through and ensure everything is saved:
+ds.stream_and_save(show_progress=True)
+
+# Later, reload from disk completely offline:
+offline_ds = pdl.load_from_disk("./coco_archive")
+print(len(offline_ds))
+```
+
 ---
 
 ## PyTorch DataLoader Integration
@@ -243,6 +278,8 @@ def load_dataset(
     split: Optional[str] = None,
     cache_dir: Optional[str] = None,
     streaming: bool = False,
+    save_to_disk: Optional[Union[bool, str]] = None,
+    background_download: bool = False,
     columns: Optional[Sequence[str]] = None,
     token: Optional[Union[bool, str]] = None,
     revision: Optional[str] = None,
@@ -257,9 +294,13 @@ def load_dataset(
 - **`path`**: Hugging Face repo ID, local path, directory, or direct URL.
 - **`split`**: Split name (e.g. `'train'`, `'validation'`), split slice (`'train[:1000]'`), or `None` for all splits.
 - **`streaming`**: If `True`, enables random-access streaming with zero full-file disk downloads. If `False`, downloads files to disk and opens them locally.
+- **`save_to_disk`**: Path string or `True`. Enables progressive saving to disk while streaming immediately without blocking.
+- **`background_download`**: If `True`, starts a background worker thread to prefetch and archive remaining row groups to disk.
 - **`columns`**: Column projection list.
 - **`max_cached_row_groups`**: Number of decoded row group tables to keep in RAM simultaneously (default `2`).
 - **`disk_cache`**: If `True`, caches fetched row groups to SSD in Feather format for sub-millisecond repeated reads.
+- **`max_workers`**: Concurrency level for metadata indexing or file downloads.
+- **`show_progress`**: Whether to display progress bars.
 
 ### `load_from_disk(dataset_path, columns=None)`
 Reloads a dataset or multi-split dataset directory saved via `dataset.save_to_disk(...)`.
