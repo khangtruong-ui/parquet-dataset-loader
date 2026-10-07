@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-10-07
+
+### Fixed
+- Fixed `TypeError: cannot unpack non-iterable ParquetFile object` in `RowGroupReader._get_parquet_file` when open file handles reach `max_open_files` capacity (default 8). Corrected tuple unpacking by using `OrderedDict.popitem(last=False)`.
+- Implemented true LRU eviction ordering for open file handles with `OrderedDict.move_to_end()` on cache hits.
+- Added file descriptor cleanup if `ParquetFile` initialization fails.
+- Fixed file ordering in `load_from_disk()` for progressively saved row group files.
+
+### Added
+- Unit tests in `tests/test_reader.py` covering LRU file handle eviction and default capacity eviction beyond 8 files.
+- Unit test in `tests/test_progressive.py` covering multi-file dataset `stream_and_save` beyond `max_open_files` followed by offline `load_from_disk`.
+
 ## [0.2.0] - 2026-10-06
 
 ### Added

@@ -43,3 +43,9 @@ def test_coco_inpainted_indexed_streaming() -> None:
     # Test slice of 2 items
     batch = ds[50000:50002]
     assert len(batch["mask"]) == 2
+
+    # Test reading row 16,000 (located in 8.parquet, triggering eviction past 8 open files)
+    row_16k = ds[16000]
+    assert isinstance(row_16k, dict)
+    assert "mask" in row_16k
+

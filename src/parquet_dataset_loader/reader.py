@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import os
 import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import fsspec
 import pyarrow as pa
@@ -51,9 +52,9 @@ class RowGroupReader:
         self.progressive_saver = progressive_saver
         self.token = token
         self.block_size = block_size
-        self.max_open_files = max_open_files
+        self.max_open_files = max(1, max_open_files)
 
-        self._open_files: Dict[str, Tuple[Any, pq.ParquetFile]] = {}
+        self._open_files: OrderedDict[str, Tuple[Any, pq.ParquetFile]] = OrderedDict()
         self._lock = threading.Lock()
 
         # Configure filesystem
@@ -64,25 +65,35 @@ class RowGroupReader:
         """Obtain a reusable ParquetFile instance for the specified file."""
         with self._lock:
             if file_url_or_path in self._open_files:
+                self._open_files.move_to_end(file_url_or_path)
                 _, pf = self._open_files[file_url_or_path]
                 return pf
 
             # Close oldest file handle if capacity reached
             if len(self._open_files) >= self.max_open_files:
-                oldest_url, (fp, _) = self._open_files.pop(next(iter(self._open_files)))
+                oldest_url, (fp, _) = self._open_files.popitem(last=False)
                 try:
                     fp.close()
                 except Exception:
                     pass
 
             is_remote = file_url_or_path.startswith(("http://", "https://"))
-            if is_remote:
-                fp = self._http_fs.open(file_url_or_path, "rb", block_size=self.block_size)
-                pf = pq.ParquetFile(fp)
-            else:
-                abs_path = os.path.abspath(os.path.expanduser(file_url_or_path))
-                fp = open(abs_path, "rb")
-                pf = pq.ParquetFile(fp, memory_map=True)
+            fp = None
+            try:
+                if is_remote:
+                    fp = self._http_fs.open(file_url_or_path, "rb", block_size=self.block_size)
+                    pf = pq.ParquetFile(fp)
+                else:
+                    abs_path = os.path.abspath(os.path.expanduser(file_url_or_path))
+                    fp = open(abs_path, "rb")
+                    pf = pq.ParquetFile(fp, memory_map=True)
+            except Exception:
+                if fp is not None:
+                    try:
+                        fp.close()
+                    except Exception:
+                        pass
+                raise
 
             self._open_files[file_url_or_path] = (fp, pf)
             return pf

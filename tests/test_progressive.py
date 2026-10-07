@@ -114,3 +114,49 @@ def test_background_downloader(temp_dir: str, sample_dataset_dir: str) -> None:
     assert ds.is_fully_saved
 
     ds.close()
+
+
+def test_stream_and_save_multi_file_dataset_beyond_max_open_files(temp_dir: str) -> None:
+    """Test stream_and_save on a dataset with 10 files (exceeding max_open_files=8).
+
+    Guarantees no unpack exceptions occur during full dataset streaming and that
+    all row groups are saved and loadable offline.
+    """
+    data_dir = os.path.join(temp_dir, "multi_file_data")
+    os.makedirs(data_dir, exist_ok=True)
+    num_files = 10
+    rows_per_file = 15
+
+    for i in range(num_files):
+        f = os.path.join(data_dir, f"train-{i:05d}.parquet")
+        create_sample_parquet_file(
+            f,
+            num_rows=rows_per_file,
+            row_group_size=rows_per_file,
+            start_id=i * rows_per_file,
+        )
+
+    save_path = os.path.join(temp_dir, "multi_saved")
+    ds = load_dataset(
+        data_dir,
+        split="train",
+        streaming=True,
+        save_to_disk=save_path,
+        columns=["id", "text"],
+    )
+
+    assert len(ds) == num_files * rows_per_file
+    assert ds.save_progress == 0.0
+
+    # Stream through all 10 files (triggers eviction at file 8 and 9)
+    ds.stream_and_save(show_progress=False)
+    assert ds.is_fully_saved
+    assert ds.save_progress == 1.0
+
+    # Verify offline reload
+    offline_ds = load_from_disk(save_path)
+    assert len(offline_ds) == num_files * rows_per_file
+    assert offline_ds[0]["id"] == 0
+    assert offline_ds[-1]["id"] == (num_files * rows_per_file) - 1
+    assert list(offline_ds[0].keys()) == ["id", "text"]
+

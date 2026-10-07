@@ -265,14 +265,21 @@ def load_from_disk(
             for f in sorted(files):
                 if f.endswith(".feather"):
                     rg_files.append(os.path.join(root, f))
+        rg_files.sort()
         if rg_files:
             batches = []
+            schema = None
             for rgf in rg_files:
                 tbl = feather.read_table(
                     rgf, columns=list(columns) if columns else None, memory_map=True
                 )
+                if schema is None:
+                    schema = tbl.schema
                 batches.extend(tbl.to_batches())
-            table = pa.Table.from_batches(batches)
+            if not batches:
+                table = pa.Table.from_batches([], schema=schema or pa.schema([]))
+            else:
+                table = pa.Table.from_batches(batches, schema=schema)
             manifest_files = [f for f in entries if f.endswith("_manifest.json")]
             split_name = (
                 manifest_files[0].replace("_manifest.json", "")

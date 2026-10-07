@@ -43,3 +43,76 @@ def test_row_group_reader_error(temp_dir: str) -> None:
             reader.read_row_group(os.path.join(temp_dir, "missing.parquet"), 0)
     finally:
         reader.close()
+
+
+def test_row_group_reader_lru_file_eviction(temp_dir: str) -> None:
+    """Test that file handles are evicted according to LRU policy when max_open_files is reached."""
+    # Create 6 files
+    files = [
+        create_sample_parquet_file(
+            os.path.join(temp_dir, f"file_{i}.parquet"),
+            num_rows=20,
+            row_group_size=10,
+            start_id=i * 20,
+        )
+        for i in range(6)
+    ]
+
+    reader = RowGroupReader(max_open_files=3)
+    try:
+        # Read files 0, 1, 2 -> pool is full (size 3)
+        reader.read_row_group(files[0], 0)
+        reader.read_row_group(files[1], 0)
+        reader.read_row_group(files[2], 0)
+        assert len(reader._open_files) == 3
+        assert list(reader._open_files.keys()) == [files[0], files[1], files[2]]
+
+        # Re-read file 0 -> moves file 0 to MRU position: order becomes [files[1], files[2], files[0]]
+        reader.read_row_group(files[0], 1)
+        assert list(reader._open_files.keys()) == [files[1], files[2], files[0]]
+
+        # Read file 3 -> should evict files[1] (oldest), keeping files[2], files[0], files[3]
+        reader.read_row_group(files[3], 0)
+        assert len(reader._open_files) == 3
+        assert list(reader._open_files.keys()) == [files[2], files[0], files[3]]
+        assert files[1] not in reader._open_files
+
+        # Re-read evicted file 1 -> evicts files[2]
+        tbl = reader.read_row_group(files[1], 0)
+        assert tbl.num_rows == 10
+        assert len(reader._open_files) == 3
+        assert list(reader._open_files.keys()) == [files[0], files[3], files[1]]
+    finally:
+        reader.close()
+        assert len(reader._open_files) == 0
+
+
+def test_row_group_reader_default_capacity_eviction(temp_dir: str) -> None:
+    """Verify that default max_open_files=8 evicts cleanly without unpack errors at file 8 and beyond."""
+    files = [
+        create_sample_parquet_file(
+            os.path.join(temp_dir, f"split_file_{i}.parquet"),
+            num_rows=10,
+            row_group_size=10,
+            start_id=i * 10,
+        )
+        for i in range(12)
+    ]
+
+    reader = RowGroupReader(max_open_files=8)
+    try:
+        for i, f in enumerate(files):
+            tbl = reader.read_row_group(f, 0)
+            assert tbl.num_rows == 10
+            expected_len = min(i + 1, 8)
+            assert len(reader._open_files) == expected_len
+
+        # Pool size remains bounded at 8
+        assert len(reader._open_files) == 8
+        # The oldest files (0 through 3) should have been evicted; newest 8 kept (4 through 11)
+        assert files[0] not in reader._open_files
+        assert files[3] not in reader._open_files
+        assert files[11] in reader._open_files
+    finally:
+        reader.close()
+
