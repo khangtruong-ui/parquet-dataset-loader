@@ -171,6 +171,21 @@ class RowGroupReader:
             self._open_files.clear()
         self.memory_cache.clear()
 
+    def __getstate__(self) -> Dict[str, Any]:
+        state = self.__dict__.copy()
+        state.pop("_lock", None)
+        state.pop("_open_files", None)
+        state.pop("_http_fs", None)
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+        self._open_files = OrderedDict()
+        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        self._http_fs = fsspec.filesystem("http", headers=headers)
+
+
 
 def download_single_file(
     url: str,

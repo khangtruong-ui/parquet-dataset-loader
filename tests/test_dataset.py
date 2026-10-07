@@ -176,3 +176,13 @@ def test_parquet_dataset_dict(sample_dataset: IndexedParquetDataset) -> None:
     assert isinstance(hf_dict, datasets.DatasetDict)
     assert len(hf_dict["train"]) == 100
     assert len(hf_dict["test"]) == 10
+
+
+def test_dataset_pickle_and_multiprocessing(sample_dataset: IndexedParquetDataset) -> None:
+    import pickle
+    dumped = pickle.dumps(sample_dataset)
+    restored = pickle.loads(dumped)
+    assert len(restored) == len(sample_dataset)
+    assert restored[0]["id"] == sample_dataset[0]["id"]
+    assert restored[99]["id"] == sample_dataset[99]["id"]
+

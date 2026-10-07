@@ -126,6 +126,16 @@ class RowGroupMemoryCache:
                 "max_entries": self.max_entries,
             }
 
+    def __getstate__(self) -> Dict[str, Any]:
+        state = self.__dict__.copy()
+        state.pop("_lock", None)
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+
+
 
 class DiskCache:
     """Persistent on-disk cache for row groups using PyArrow Feather (IPC).
@@ -208,3 +218,13 @@ class DiskCache:
                             os.remove(os.path.join(self.cache_dir, f))
                         except OSError:
                             pass
+
+    def __getstate__(self) -> Dict[str, Any]:
+        state = self.__dict__.copy()
+        state.pop("_lock", None)
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+

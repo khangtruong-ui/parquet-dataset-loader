@@ -746,6 +746,15 @@ class IndexedParquetDataset(collections.abc.Sequence):
             f")"
         )
 
+    def __getstate__(self) -> Dict[str, Any]:
+        state = self.__dict__.copy()
+        state["background_downloader"] = None
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+
+
 
 class ParquetDatasetDict(dict):
     """Dictionary container mapping split names to IndexedParquetDataset instances.
