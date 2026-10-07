@@ -3,7 +3,7 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Tests: Pytest](https://img.shields.io/badge/tests-passing-brightgreen.svg)](tests/)
-[![Version: 0.1.0](https://img.shields.io/badge/version-0.1.0-orange.svg)](pyproject.toml)
+[![Version: 0.2.2](https://img.shields.io/badge/version-0.2.2-orange.svg)](pyproject.toml)
 
 A high-performance, memory-efficient Python library dedicated to loading large Parquet datasets from Hugging Face Hub and local storage. Featuring **instant random-access index-based streaming** without downloading multi-gigabyte or terabyte files to disk.
 
@@ -149,17 +149,67 @@ print(batch.keys())  # dict_keys(['mask'])
 print(len(batch["mask"]))  # 5
 ```
 
-### 3. Seekable Streaming (`iter_from`)
+### 3. Seekable Streaming (`iter_from`, `stream`, `start_index`)
 
-Resume training or start reading from any arbitrary index instantly:
+Resume training or start reading from any arbitrary index instantly without reading prior row groups:
 
 ```python
-# Stream starting from index 100,000 without reading earlier rows
+# Stream starting from index 100,000 via iter_from() or stream()
 for row in ds.iter_from(start_index=100000):
+    process(row)
+
+# Or specify start_index directly when loading (both streaming and non-streaming):
+ds = pdl.load_dataset(
+    "KhangTruong/COCO-inpainted",
+    split="train",
+    streaming=True,
+    start_index=100000,
+)
+```
+
+### 4. Reproducible Shuffling with Seed (`shuffle`, `seed`)
+
+Fully supported across **both streaming (`streaming=True`) and non-streaming (`streaming=False`)** modes:
+
+- **Reproducible Ordering**: Providing `seed` guarantees 100% deterministic, reproducible sample ordering across runs.
+- **Instant Random Access**: Index permutation shuffle enables instant $O(\log M)$ index lookup `shuffled_ds[i]`, slicing, and PyTorch `DataLoader` compatibility without downloading full files.
+- **Combined with Streaming from Index**: Resume training on a shuffled stream from an exact checkpoint step!
+- **Streaming Buffer Shuffle**: For unbounded streams or very small memory environments, specify `buffer_size` to shuffle within a rolling buffer.
+
+```python
+# Approach A: Direct parameter in load_dataset (streaming or non-streaming)
+ds_shuffled = pdl.load_dataset(
+    "KhangTruong/COCO-inpainted",
+    split="train",
+    streaming=True,
+    shuffle=True,
+    seed=42,
+)
+
+# Approach B: Call .shuffle(seed=...) on loaded dataset or dataset dictionary
+ds_shuffled = ds.shuffle(seed=42)
+
+# Resume / stream from index 50,000 of the shuffled dataset
+for row in ds_shuffled.iter_from(start_index=50000):
+    process(row)
+
+# Or combine shuffle and resume directly in load_dataset:
+ds_resume = pdl.load_dataset(
+    "KhangTruong/COCO-inpainted",
+    split="train",
+    streaming=True,
+    shuffle=True,
+    seed=42,
+    start_index=50000,  # Starts streaming from index 50,000 of the seed-42 permutation
+)
+
+# Streaming buffer shuffle (rolling window of 10,000 rows):
+ds_buf = ds.shuffle(seed=42, buffer_size=10000)
+for row in ds_buf:
     process(row)
 ```
 
-### 4. Zero-Copy Views (`take`, `skip`, `slice`)
+### 5. Zero-Copy Views (`take`, `skip`, `slice`)
 
 Create sub-dataset views without copying data:
 
@@ -169,7 +219,7 @@ train_tail = ds.skip(100000)   # Rows from 100,000 onwards
 train_slice = ds.slice(500, 200) # 200 rows starting at 500
 ```
 
-### 5. Conversion to Hugging Face, Arrow, and Pandas
+### 6. Conversion to Hugging Face, Arrow, and Pandas
 
 ```python
 # Convert a slice or small dataset to a Hugging Face Dataset
@@ -182,7 +232,7 @@ arrow_table = ds.take(100).to_arrow()
 df = ds.take(100).to_pandas()
 ```
 
-### 6. Full Split Dictionary Handling (`split=None`)
+### 7. Full Split Dictionary Handling (`split=None`)
 
 ```python
 # Loads all splits into a ParquetDatasetDict
@@ -190,9 +240,12 @@ ds_dict = pdl.load_dataset("KhangTruong/COCO-inpainted", split=None, streaming=T
 
 print(ds_dict.keys())  # ['train', 'validation']
 print(f"Train: {len(ds_dict['train']):,} | Validation: {len(ds_dict['validation']):,}")
+
+# Shuffle all splits with seed simultaneously:
+shuffled_dict = ds_dict.shuffle(seed=42)
 ```
 
-### 7. Disk Loading & Saving
+### 8. Disk Loading & Saving
 
 ```python
 # Save dataset to disk in Arrow IPC (Feather) format
@@ -203,7 +256,7 @@ reloaded = pdl.load_from_disk("./my_local_data")
 print(len(reloaded))  # 500
 ```
 
-### 8. Streaming + Save to Disk Simultaneously (Zero Initial Wait)
+### 9. Streaming + Save to Disk Simultaneously (Zero Initial Wait)
 
 If you want a local copy on disk, standard Hugging Face `load_dataset("...", streaming=False)` forces you to wait for the entire 62 GB download before you can access a single sample.
 
@@ -238,7 +291,7 @@ offline_ds = pdl.load_from_disk("./coco_archive")
 print(len(offline_ds))
 ```
 
-### 9. Hugging Face Authentication & High Quotas (`HF_TOKEN`)
+### 10. Hugging Face Authentication & High Quotas (`HF_TOKEN`)
 
 Authenticated Hugging Face accounts benefit from significantly higher rate limits, increased download throughput, and access to private or gated repositories. `parquet-dataset-loader` seamlessly supports authentication:
 
@@ -266,24 +319,27 @@ Authentication headers (`Authorization: Bearer <token>`) are automatically appli
 
 ## PyTorch DataLoader Integration
 
-Because `IndexedParquetDataset` implements standard Python sequence protocols (`__len__` and `__getitem__`), you can plug it straight into PyTorch `DataLoader`:
+Because `IndexedParquetDataset` implements standard Python sequence protocols (`__len__` and `__getitem__`), you can plug it straight into PyTorch `DataLoader` — including with deterministic shuffling:
 
 ```python
 from torch.utils.data import DataLoader
 import parquet_dataset_loader as pdl
 
+# Load dataset in streaming mode with deterministic shuffling
 ds = pdl.load_dataset(
     "KhangTruong/COCO-inpainted",
     split="train",
     streaming=True,
     columns=["mask"],
+    shuffle=True,
+    seed=42,
     max_cached_row_groups=4,
 )
 
-dataloader = DataLoader(ds, batch_size=32, shuffle=False)
+dataloader = DataLoader(ds, batch_size=32)
 
 for batch in dataloader:
-    # batch['mask'] is yielded batch by batch
+    # batch['mask'] is yielded in deterministic shuffled order
     pass
 ```
 
@@ -311,6 +367,11 @@ def load_dataset(
     disk_cache: bool = False,
     max_workers: int = 16,
     show_progress: bool = False,
+    shuffle: Optional[bool] = None,
+    seed: Optional[int] = None,
+    buffer_size: Optional[int] = None,
+    start_index: Optional[int] = None,
+    from_index: Optional[int] = None,
     **kwargs,
 ) -> Union[IndexedParquetDataset, ParquetDatasetDict]
 ```
@@ -318,6 +379,10 @@ def load_dataset(
 - **`path`**: Hugging Face repo ID, local path, directory, or direct URL.
 - **`split`**: Split name (e.g. `'train'`, `'validation'`), split slice (`'train[:1000]'`), or `None` for all splits.
 - **`streaming`**: If `True`, enables random-access streaming with zero full-file disk downloads. If `False`, downloads files to disk and opens them locally.
+- **`shuffle`**: If `True` (or if `seed` is passed without `shuffle=False`), enables deterministic shuffling. Supported with both streaming and non-streaming.
+- **`seed`**: Integer seed for 100% reproducible shuffling.
+- **`buffer_size`**: Optional buffer size for streaming buffer-based shuffle.
+- **`start_index` / `from_index`**: Row index to start/resume streaming from (0-indexed). Supported in both streaming and non-streaming.
 - **`save_to_disk`**: Path string or `True`. Enables progressive saving to disk while streaming immediately without blocking.
 - **`background_download`**: If `True`, starts a background worker thread to prefetch and archive remaining row groups to disk.
 - **`columns`**: Column projection list.
@@ -326,14 +391,14 @@ def load_dataset(
 - **`max_workers`**: Concurrency level for metadata indexing or file downloads.
 - **`show_progress`**: Whether to display progress bars.
 
-### `load_from_disk(dataset_path, columns=None)`
+### `load_from_disk(dataset_path, columns=None, shuffle=None, seed=None, start_index=None, ...)`
 Reloads a dataset or multi-split dataset directory saved via `dataset.save_to_disk(...)`.
 
 ---
 
 ## Running Tests
 
-The test suite contains 32 comprehensive unit and integration tests:
+The test suite contains 59 comprehensive unit and integration tests:
 
 ```bash
 # Run unit tests (offline, fast)
@@ -349,15 +414,22 @@ pytest
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+### Version 0.2.2
+- **Reproducible Shuffling with Seed**: Added `shuffle` and `seed` support to `load_dataset`, `IndexedParquetDataset.shuffle(seed=...)`, and `ParquetDatasetDict.shuffle(seed=...)`. Fully supported across both streaming and non-streaming modes with 100% deterministic reproducibility.
+- **Streaming from Index**: Added `start_index` and `from_index` parameter to `load_dataset`, as well as `ds.iter_from(start_index)` and `ds.stream(start_index)`. Enables instant seek and checkpoint resuming on both unshuffled and shuffled datasets.
+- **Streaming Buffer Shuffle**: Added `buffer_size` support to `shuffle(seed=..., buffer_size=...)` for rolling buffer-based random streaming.
+- **Batch & Arrow Shuffled Materialization**: Optimized row-group-grouped extraction in `to_arrow()`, `to_pandas()`, `to_hf_dataset()`, and `save_to_disk()` for shuffled views.
+
+### Version 0.2.1
+- **Full Hugging Face Authentication Support (`HF_TOKEN`)**:
+  - Added automatic resolution and propagation of authentication tokens (`HF_TOKEN`, Colab secrets, login cache).
+  - Fixed LRU file handle eviction in `RowGroupReader`.
+
+### Version 0.2.0
+- Simultaneous Streaming + Save-to-Disk with `ProgressiveDiskSaver` and `BackgroundDownloader`.
+
 ### Version 0.1.0
-- Initial release.
-- HTTP Range-based metadata index extraction (`Range: bytes=-65536`).
-- $O(\log M)$ binary-search random-access row locator.
-- `IndexedParquetDataset` and `ParquetDatasetDict` abstractions.
-- Thread-safe `RowGroupMemoryCache` (LRU) and `DiskCache` (Feather).
-- Full column projection support.
-- Hugging Face `load_dataset`-compatible API and split slice syntax (`train[:1000]`).
-- Verification on `KhangTruong/COCO-inpainted` (62.4 GB).
+- Initial release with HTTP Range-based metadata index extraction and $O(\log M)$ binary-search random-access row locator.
 
 ---
 

@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-10-07
+
+### Added
+- **Reproducible Shuffling with Seed (`shuffle` / `seed`)**:
+  - Full support for `load_dataset(..., shuffle=True, seed=42)` across both streaming (`streaming=True`) and non-streaming (`streaming=False`) modes.
+  - Added `.shuffle(seed=...)` to `IndexedParquetDataset` and `ParquetDatasetDict`.
+  - 100% deterministic pseudo-random ordering when provided a seed; different seeds produce distinct permutations.
+  - Preserves instant $O(\log M)$ random-access indexing, batch slicing matching HF format, and PyTorch `DataLoader` compatibility on shuffled datasets.
+  - Streaming buffer shuffle (`buffer_size=N`) for bounded-memory randomized streaming over remote datasets.
+  - Optimized PyArrow, Pandas, and Hugging Face Dataset conversions (`to_arrow()`, `to_pandas()`, `to_hf_dataset()`) grouping row group decodes to eliminate cache evictions on shuffled datasets.
+- **Streaming from Index (`start_index` / `from_index` / `iter_from` / `stream`)**:
+  - Added `start_index` and `from_index` parameters to `load_dataset(...)` and `load_from_disk(...)`.
+  - Added `stream()` and `stream_from()` convenience methods to `IndexedParquetDataset` aliasing `iter_from()`.
+  - Seamlessly combines with shuffling: stream or resume training from an arbitrary index of a seed-permuted dataset.
+  - Added `skip()`, `take()`, and `slice()` utility methods on `ParquetDatasetDict`.
+- **Comprehensive Test Suite**:
+  - Added `tests/test_shuffle_and_stream.py` with 15 tests verifying reproducibility, indexing, slicing, Arrow/Pandas/HF conversions, disk saving, and both streaming/non-streaming parameter configurations.
+- **Runnable Example**:
+  - Added `examples/shuffle_and_streaming.py` demonstrating shuffle with seed and streaming from index.
+
 ## [0.2.1] - 2026-10-07
 
 ### Added

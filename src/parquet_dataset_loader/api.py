@@ -59,12 +59,18 @@ def load_dataset(
     disk_cache: bool = False,
     max_workers: int = 16,
     show_progress: bool = False,
+    shuffle: Optional[bool] = None,
+    seed: Optional[int] = None,
+    buffer_size: Optional[int] = None,
+    start_index: Optional[int] = None,
+    from_index: Optional[int] = None,
     **kwargs: Any,
 ) -> Union[IndexedParquetDataset, ParquetDatasetDict]:
     """Load a Parquet dataset from Hugging Face Hub, local files, or remote URLs.
 
     Provides a drop-in replacement for `datasets.load_dataset` with high-performance
-    metadata indexing, random-access streaming, and simultaneous progressive disk persistence.
+    metadata indexing, random-access streaming, reproducible shuffle with seed,
+    streaming from arbitrary index, and simultaneous progressive disk persistence.
 
     Args:
         path: Hugging Face repo ID (e.g. 'KhangTruong/COCO-inpainted'), local path,
@@ -90,6 +96,13 @@ def load_dataset(
         disk_cache: Whether to cache fetched row groups to local disk during streaming.
         max_workers: Concurrency level for metadata indexing or file downloads.
         show_progress: Whether to show progress bars.
+        shuffle: If True (or if seed is provided without shuffle=False), shuffles the
+            dataset. Supported with both streaming and non-streaming modes.
+        seed: Optional integer seed for reproducible shuffling.
+        buffer_size: Optional buffer size for streaming buffer-based shuffle.
+        start_index: Optional index to stream from (0-indexed). Resumes or starts
+            streaming from this index. Supported in both streaming and non-streaming.
+        from_index: Alias for start_index.
         **kwargs: Additional parameters for forward compatibility.
 
     Returns:
@@ -153,6 +166,15 @@ def load_dataset(
             else:
                 downloaded_splits_map[s] = urls
         splits_map = downloaded_splits_map
+
+    # Determine whether shuffle and start_index are requested
+    should_shuffle = False
+    if shuffle is True:
+        should_shuffle = True
+    elif shuffle is None and seed is not None:
+        should_shuffle = True
+
+    eff_start_index = start_index if start_index is not None else from_index
 
     # Build datasets for target splits
     datasets: Dict[str, IndexedParquetDataset] = {}
@@ -225,6 +247,14 @@ def load_dataset(
             length = max(0, stop - start)
             ds = ds.slice(start, length)
 
+        # Apply shuffle with seed if requested
+        if should_shuffle:
+            ds = ds.shuffle(seed=seed, buffer_size=buffer_size)
+
+        # Apply stream start index if requested
+        if eff_start_index is not None and eff_start_index > 0:
+            ds = ds.skip(eff_start_index)
+
         datasets[s] = ds
 
     if base_split is not None:
@@ -236,12 +266,24 @@ def load_dataset(
 def load_from_disk(
     dataset_path: str,
     columns: Optional[Sequence[str]] = None,
+    shuffle: Optional[bool] = None,
+    seed: Optional[int] = None,
+    buffer_size: Optional[int] = None,
+    start_index: Optional[int] = None,
+    from_index: Optional[int] = None,
+    **kwargs: Any,
 ) -> Union[IndexedParquetDataset, ParquetDatasetDict]:
     """Load a dataset previously saved to disk via save_to_disk().
 
     Args:
         dataset_path: Path to the directory containing saved dataset files.
         columns: Optional column projection list.
+        shuffle: Optional shuffle flag.
+        seed: Optional integer seed for reproducible shuffling.
+        buffer_size: Optional buffer size for streaming buffer shuffle.
+        start_index: Optional row index to stream from.
+        from_index: Alias for start_index.
+        **kwargs: Additional parameters passed to load_dataset.
 
     Returns:
         IndexedParquetDataset or ParquetDatasetDict.
@@ -259,7 +301,16 @@ def load_from_disk(
         splits_dict: Dict[str, IndexedParquetDataset] = {}
         for d in sorted(subdirs):
             split_dir = os.path.join(abs_path, d)
-            splits_dict[d] = load_from_disk(split_dir, columns=columns)  # type: ignore
+            splits_dict[d] = load_from_disk(
+                split_dir,
+                columns=columns,
+                shuffle=shuffle,
+                seed=seed,
+                buffer_size=buffer_size,
+                start_index=start_index,
+                from_index=from_index,
+                **kwargs,
+            )  # type: ignore
         return ParquetDatasetDict(splits_dict)
 
     # Check if this is a progressive save directory with row_groups/
@@ -298,6 +349,12 @@ def load_from_disk(
                 split=split_name,
                 streaming=False,
                 columns=columns,
+                shuffle=shuffle,
+                seed=seed,
+                buffer_size=buffer_size,
+                start_index=start_index,
+                from_index=from_index,
+                **kwargs,
             )
 
     # Single split
@@ -324,4 +381,10 @@ def load_from_disk(
         split=split_name,
         streaming=False,
         columns=columns,
+        shuffle=shuffle,
+        seed=seed,
+        buffer_size=buffer_size,
+        start_index=start_index,
+        from_index=from_index,
+        **kwargs,
     )

@@ -31,7 +31,7 @@ from parquet_dataset_loader.index import (
 from parquet_dataset_loader.progressive import BackgroundDownloader, ProgressiveDiskSaver
 from parquet_dataset_loader.reader import RowGroupReader, download_parquet_files
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 __all__ = [
     "__version__",
     "load_dataset",
