@@ -28,7 +28,7 @@ from parquet_dataset_loader.exceptions import (
     NetworkRangeError,
     RateLimitError,
 )
-from parquet_dataset_loader.hf_resolver import create_retry_session
+from parquet_dataset_loader.hf_resolver import create_retry_session, resolve_hf_token
 
 
 @dataclass
@@ -274,7 +274,7 @@ def calculate_row_group_byte_span(rg: pq.RowGroupMetaData) -> Tuple[int, int]:
 def fetch_remote_parquet_footer(
     url: str,
     session: requests.Session,
-    token: Optional[str] = None,
+    token: Optional[Union[bool, str]] = None,
     timeout: int = 20,
 ) -> Tuple[int, pq.FileMetaData]:
     """Fetch and parse the Parquet FileMetaData footer via HTTP Range requests.
@@ -296,9 +296,10 @@ def fetch_remote_parquet_footer(
         RateLimitError: If HTTP 429 Too Many Requests is encountered.
         CorruptParquetError: If the footer magic bytes are invalid.
     """
+    auth_token = resolve_hf_token(token)
     headers = {"Range": "bytes=-65536"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
 
     try:
         resp = session.get(url, headers=headers, timeout=timeout)
@@ -341,13 +342,14 @@ def fetch_remote_parquet_footer(
     else:
         # Footer is larger than 64KB, fetch exact byte range
         if total_size == 0:
-            head = session.head(url, headers={"Authorization": f"Bearer {token}"} if token else {})
+            head_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+            head = session.head(url, headers=head_headers)
             total_size = int(head.headers.get("content-length", 0))
 
         start_byte = total_size - (footer_len + 8)
         headers2 = {"Range": f"bytes={start_byte}-{total_size - 1}"}
-        if token:
-            headers2["Authorization"] = f"Bearer {token}"
+        if auth_token:
+            headers2["Authorization"] = f"Bearer {auth_token}"
         resp2 = session.get(url, headers=headers2, timeout=timeout)
         if resp2.status_code not in (200, 206):
             raise NetworkRangeError(url, resp2.status_code, "Failed fetching full footer")
@@ -380,7 +382,7 @@ def _index_single_file(
     file_idx: int,
     url_or_path: str,
     session: requests.Session,
-    token: Optional[str] = None,
+    token: Optional[Union[bool, str]] = None,
 ) -> Tuple[int, int, pq.FileMetaData]:
     """Index a single file (remote or local).
 
@@ -400,7 +402,7 @@ def build_metadata_index(
     split_name: str = "train",
     cache_dir: Optional[str] = None,
     max_workers: int = 16,
-    token: Optional[str] = None,
+    token: Optional[Union[bool, str]] = None,
     use_cache: bool = True,
 ) -> MetadataIndex:
     """Build a complete MetadataIndex across a sequence of Parquet files.
@@ -414,7 +416,7 @@ def build_metadata_index(
         split_name: Split name (e.g. 'train').
         cache_dir: Optional directory to read/write cached metadata index.
         max_workers: Maximum threads for concurrent footer requests.
-        token: Optional Hugging Face auth token.
+        token: Optional Hugging Face auth token (or True to use stored/env token).
         use_cache: Whether to use disk caching for the index.
 
     Returns:
@@ -422,6 +424,8 @@ def build_metadata_index(
     """
     if not files:
         raise ValueError("Cannot build MetadataIndex from an empty list of files.")
+
+    auth_token = resolve_hf_token(token)
 
     # Determine cache path
     cache_file: Optional[str] = None
@@ -442,7 +446,7 @@ def build_metadata_index(
 
     with ThreadPoolExecutor(max_workers=min(max_workers, len(files))) as executor:
         futures = {
-            executor.submit(_index_single_file, idx, url, session, token): idx
+            executor.submit(_index_single_file, idx, url, session, auth_token): idx
             for idx, url in enumerate(files)
         }
         for future in as_completed(futures):

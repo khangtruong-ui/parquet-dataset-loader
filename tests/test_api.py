@@ -76,3 +76,21 @@ def test_save_and_load_from_disk_multi_split(temp_dir: str, sample_dataset_dir: 
     assert isinstance(reloaded_dict, ParquetDatasetDict)
     assert "train" in reloaded_dict
     assert len(reloaded_dict["train"]) == 100
+
+
+def test_load_dataset_token_propagation(sample_dataset_dir: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 1. Automatic resolution from HF_TOKEN env var
+    monkeypatch.setenv("HF_TOKEN", "hf_propagated_token")
+    ds = load_dataset(sample_dataset_dir, split="train", streaming=True)
+    assert ds.reader.token == "hf_propagated_token"
+
+    # 2. Explicit token=False disables auth
+    ds_no_auth = load_dataset(sample_dataset_dir, split="train", streaming=True, token=False)
+    assert ds_no_auth.reader.token is None
+
+    # 3. Explicit string override
+    ds_override = load_dataset(
+        sample_dataset_dir, split="train", streaming=True, token="hf_explicit_override"
+    )
+    assert ds_override.reader.token == "hf_explicit_override"
+

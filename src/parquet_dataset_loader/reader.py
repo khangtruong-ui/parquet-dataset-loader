@@ -20,7 +20,7 @@ from tqdm import tqdm
 
 from parquet_dataset_loader.cache import DiskCache, RowGroupMemoryCache
 from parquet_dataset_loader.exceptions import CorruptParquetError, ParquetDatasetError
-from parquet_dataset_loader.hf_resolver import create_retry_session
+from parquet_dataset_loader.hf_resolver import create_retry_session, resolve_hf_token
 
 
 class RowGroupReader:
@@ -41,7 +41,7 @@ class RowGroupReader:
         memory_cache: Optional[RowGroupMemoryCache] = None,
         disk_cache: Optional[DiskCache] = None,
         progressive_saver: Optional[Any] = None,
-        token: Optional[str] = None,
+        token: Optional[Union[bool, str]] = None,
         block_size: int = 2 * 1024 * 1024,  # 2 MB default block size
         max_open_files: int = 8,
     ) -> None:
@@ -50,7 +50,7 @@ class RowGroupReader:
         )
         self.disk_cache = disk_cache
         self.progressive_saver = progressive_saver
-        self.token = token
+        self.token = resolve_hf_token(token)
         self.block_size = block_size
         self.max_open_files = max(1, max_open_files)
 
@@ -58,7 +58,7 @@ class RowGroupReader:
         self._lock = threading.Lock()
 
         # Configure filesystem
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
         self._http_fs = fsspec.filesystem("http", headers=headers)
 
     def _get_parquet_file(self, file_url_or_path: str) -> pq.ParquetFile:
@@ -176,7 +176,7 @@ def download_single_file(
     url: str,
     target_path: str,
     session: requests.Session,
-    token: Optional[str] = None,
+    token: Optional[Union[bool, str]] = None,
     chunk_size: int = 1024 * 1024,
 ) -> str:
     """Download a single remote Parquet file with resume and atomic write.
@@ -194,9 +194,10 @@ def download_single_file(
     os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
     temp_path = f"{target_path}.part"
 
+    auth_token = resolve_hf_token(token)
     headers = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
 
     # Check remote size
     head = session.head(url, headers=headers, allow_redirects=True, timeout=15)
@@ -230,7 +231,7 @@ def download_single_file(
 def download_parquet_files(
     urls: Sequence[str],
     target_dir: str,
-    token: Optional[str] = None,
+    token: Optional[Union[bool, str]] = None,
     max_workers: int = 8,
     show_progress: bool = True,
 ) -> List[str]:
@@ -248,6 +249,7 @@ def download_parquet_files(
     """
     os.makedirs(target_dir, exist_ok=True)
     session = create_retry_session()
+    auth_token = resolve_hf_token(token)
 
     local_paths = [
         os.path.join(target_dir, os.path.basename(url.split("?")[0])) for url in urls
@@ -256,7 +258,7 @@ def download_parquet_files(
     tasks = list(zip(urls, local_paths))
     with ThreadPoolExecutor(max_workers=min(max_workers, len(urls))) as executor:
         futures = {
-            executor.submit(download_single_file, url, path, session, token): idx
+            executor.submit(download_single_file, url, path, session, auth_token): idx
             for idx, (url, path) in enumerate(tasks)
         }
 

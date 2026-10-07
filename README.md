@@ -238,6 +238,30 @@ offline_ds = pdl.load_from_disk("./coco_archive")
 print(len(offline_ds))
 ```
 
+### 9. Hugging Face Authentication & High Quotas (`HF_TOKEN`)
+
+Authenticated Hugging Face accounts benefit from significantly higher rate limits, increased download throughput, and access to private or gated repositories. `parquet-dataset-loader` seamlessly supports authentication:
+
+- **Automatic Environment Detection**: Set `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) in your environment, and it is automatically applied to all operations:
+  ```bash
+  export HF_TOKEN="hf_your_token_here"
+  ```
+- **Login Cache Detection**: If you have logged in via `huggingface-cli login` or Colab secrets, your stored token is detected automatically.
+- **Explicit Parameter**:
+  ```python
+  # Pass token string explicitly
+  ds = pdl.load_dataset("org/private-dataset", token="hf_...")
+
+  # Explicitly disable authentication
+  ds = pdl.load_dataset("org/public-dataset", token=False)
+  ```
+
+Authentication headers (`Authorization: Bearer <token>`) are automatically applied to:
+- Hugging Face repository and Parquet split resolution API requests.
+- HTTP Range requests for Parquet file footers during metadata indexing.
+- Concurrent HTTP Range requests made by `fsspec` when streaming row groups.
+- Direct downloads and background prefetching workers.
+
 ---
 
 ## PyTorch DataLoader Integration

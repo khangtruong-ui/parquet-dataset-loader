@@ -32,6 +32,7 @@ from parquet_dataset_loader.exceptions import (
 from parquet_dataset_loader.hf_resolver import (
     infer_split_name,
     parse_split_slice,
+    resolve_hf_token,
     resolve_parquet_dataset,
 )
 from parquet_dataset_loader.index import build_metadata_index
@@ -103,6 +104,10 @@ def load_dataset(
     resolved_cache_dir = os.path.abspath(os.path.expanduser(cache_dir or DEFAULT_CACHE_DIR))
     os.makedirs(resolved_cache_dir, exist_ok=True)
 
+    # Resolve HF authentication token (from explicit token, HF_TOKEN env var, or local login cache)
+    auth_token = resolve_hf_token(token)
+    token_for_children = auth_token if auth_token else False
+
     # Parse potential split slicing (e.g. 'train[:1000]')
     base_split, slice_obj = parse_split_slice(split)
 
@@ -112,7 +117,7 @@ def load_dataset(
         name=name,
         split=base_split,
         data_files=data_files,
-        token=token,
+        token=token_for_children,
         revision=revision,
     )
 
@@ -140,7 +145,7 @@ def load_dataset(
                 local_files = download_parquet_files(
                     urls=urls,
                     target_dir=split_dl_dir,
-                    token=str(token) if isinstance(token, str) else None,
+                    token=token_for_children,
                     max_workers=max_workers,
                     show_progress=show_progress,
                 )
@@ -161,7 +166,7 @@ def load_dataset(
             split_name=s,
             cache_dir=resolved_cache_dir,
             max_workers=max_workers,
-            token=str(token) if isinstance(token, str) else None,
+            token=token_for_children,
         )
 
         mem_cache = RowGroupMemoryCache(max_entries=max_cached_row_groups)
@@ -192,7 +197,7 @@ def load_dataset(
             memory_cache=mem_cache,
             disk_cache=d_cache,
             progressive_saver=prog_saver,
-            token=str(token) if isinstance(token, str) else None,
+            token=token_for_children,
         )
 
         bg_downloader: Optional[BackgroundDownloader] = None

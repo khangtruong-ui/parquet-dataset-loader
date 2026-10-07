@@ -22,6 +22,52 @@ from parquet_dataset_loader.exceptions import (
 )
 
 
+def resolve_hf_token(token: Optional[Union[bool, str]] = None) -> Optional[str]:
+    """Resolve a Hugging Face authentication token from arguments, env vars, or local cache.
+
+    Resolution order:
+    1. If `token is False`: returns None (explicitly disables authentication).
+    2. If `isinstance(token, str)` and non-empty: returns `token.strip()`.
+    3. If `token is None` or `token is True`:
+       a. `HF_TOKEN` environment variable.
+       b. `HUGGING_FACE_HUB_TOKEN` environment variable.
+       c. `huggingface_hub.get_token()` (which checks local `~/.cache/huggingface/token`,
+          Colab secrets, etc.).
+
+    Args:
+        token: Explicit token string, bool, or None.
+
+    Returns:
+        Cleaned Bearer token string, or None if no token is available or disabled.
+    """
+    if token is False:
+        return None
+
+    if isinstance(token, str):
+        cleaned = token.strip()
+        return cleaned if cleaned else None
+
+    # Check HF_TOKEN then HUGGING_FACE_HUB_TOKEN
+    for env_var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        val = os.environ.get(env_var)
+        if val:
+            cleaned = val.strip()
+            if cleaned:
+                return cleaned
+
+    # Fall back to huggingface_hub stored token
+    try:
+        stored = get_token()
+        if stored:
+            cleaned = stored.strip()
+            if cleaned:
+                return cleaned
+    except Exception:
+        pass
+
+    return None
+
+
 def create_retry_session(
     retries: int = 4,
     backoff_factor: float = 0.5,
@@ -213,11 +259,7 @@ def resolve_hf_hub_dataset(
     if revision is None:
         revision = "main"
 
-    auth_token: Optional[str] = None
-    if isinstance(token, str):
-        auth_token = token
-    elif token is True or token is None:
-        auth_token = get_token()
+    auth_token = resolve_hf_token(token)
 
     headers: Dict[str, str] = {}
     if auth_token:
@@ -348,7 +390,7 @@ def resolve_parquet_dataset(
             repo_id=path,
             name=name,
             revision=revision,
-            token=token,
+            token=resolve_hf_token(token),
             session=session,
         )
     else:

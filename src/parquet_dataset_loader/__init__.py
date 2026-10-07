@@ -19,6 +19,7 @@ from parquet_dataset_loader.exceptions import (
 from parquet_dataset_loader.hf_resolver import (
     infer_split_name,
     parse_split_slice,
+    resolve_hf_token,
     resolve_parquet_dataset,
 )
 from parquet_dataset_loader.index import (
@@ -48,6 +49,7 @@ __all__ = [
     "download_parquet_files",
     "build_metadata_index",
     "resolve_parquet_dataset",
+    "resolve_hf_token",
     "parse_split_slice",
     "infer_split_name",
     "ParquetDatasetError",

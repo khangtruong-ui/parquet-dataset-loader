@@ -7,15 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.1] - 2026-10-07
 
+### Added
+- **Full Hugging Face Authentication Support (`HF_TOKEN`)**:
+  - Added `resolve_hf_token()` supporting `HF_TOKEN` and `HUGGING_FACE_HUB_TOKEN` environment variables, `huggingface-cli login` cached credentials, Colab secrets, explicit token strings, and `token=False` to explicitly disable auth.
+  - Automatically propagates authenticated headers (`Authorization: Bearer <token>`) across all components:
+    - Hugging Face split resolution API requests.
+    - HTTP Range requests for Parquet file footers during metadata indexing (`build_metadata_index`).
+    - Concurrent HTTP Range requests made by `fsspec` when streaming row groups (`RowGroupReader`).
+    - File downloads and background prefetching workers (`download_parquet_files`).
+  - Enables access to gated/private repositories and unlocks higher rate limits and download quotas for authenticated accounts.
+- Unit tests in `tests/test_reader.py` covering LRU file handle eviction and default capacity eviction beyond 8 files.
+- Unit test in `tests/test_progressive.py` covering multi-file dataset `stream_and_save` beyond `max_open_files` followed by offline `load_from_disk`.
+- Unit tests in `tests/test_hf_resolver.py` and `tests/test_api.py` covering token resolution and propagation across components.
+
 ### Fixed
 - Fixed `TypeError: cannot unpack non-iterable ParquetFile object` in `RowGroupReader._get_parquet_file` when open file handles reach `max_open_files` capacity (default 8). Corrected tuple unpacking by using `OrderedDict.popitem(last=False)`.
 - Implemented true LRU eviction ordering for open file handles with `OrderedDict.move_to_end()` on cache hits.
 - Added file descriptor cleanup if `ParquetFile` initialization fails.
 - Fixed file ordering in `load_from_disk()` for progressively saved row group files.
-
-### Added
-- Unit tests in `tests/test_reader.py` covering LRU file handle eviction and default capacity eviction beyond 8 files.
-- Unit test in `tests/test_progressive.py` covering multi-file dataset `stream_and_save` beyond `max_open_files` followed by offline `load_from_disk`.
 
 ## [0.2.0] - 2026-10-06
 

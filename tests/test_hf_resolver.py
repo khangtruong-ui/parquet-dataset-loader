@@ -76,3 +76,73 @@ def test_resolve_parquet_dataset_with_data_files(temp_dir: str) -> None:
     )
     assert splits["train"] == [f1]
     assert splits["test"] == [f2]
+
+
+def test_resolve_hf_token_explicit_string() -> None:
+    from parquet_dataset_loader.hf_resolver import resolve_hf_token
+
+    assert resolve_hf_token("hf_explicit_123") == "hf_explicit_123"
+    assert resolve_hf_token("  hf_with_spaces  ") == "hf_with_spaces"
+
+
+def test_resolve_hf_token_disabled_with_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    from parquet_dataset_loader.hf_resolver import resolve_hf_token
+
+    monkeypatch.setenv("HF_TOKEN", "hf_should_be_ignored")
+    assert resolve_hf_token(False) is None
+
+
+def test_resolve_hf_token_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from parquet_dataset_loader.hf_resolver import resolve_hf_token
+
+    # 1. HF_TOKEN env var
+    monkeypatch.setenv("HF_TOKEN", "hf_from_env_token")
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    assert resolve_hf_token() == "hf_from_env_token"
+    assert resolve_hf_token(True) == "hf_from_env_token"
+
+    # 2. HUGGING_FACE_HUB_TOKEN fallback
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "hf_from_legacy_env")
+    assert resolve_hf_token() == "hf_from_legacy_env"
+
+    # 3. HF_TOKEN takes precedence over HUGGING_FACE_HUB_TOKEN
+    monkeypatch.setenv("HF_TOKEN", "hf_primary")
+    monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "hf_secondary")
+    assert resolve_hf_token() == "hf_primary"
+
+    # 4. Explicit string takes precedence over env var
+    assert resolve_hf_token("hf_override") == "hf_override"
+
+    # 5. Empty / whitespace string in env var is treated as None
+    monkeypatch.setenv("HF_TOKEN", "   ")
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+    # Without cached login token, should be None
+    monkeypatch.setattr("parquet_dataset_loader.hf_resolver.get_token", lambda: None)
+    assert resolve_hf_token() is None
+
+
+def test_row_group_reader_inherits_hf_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    from parquet_dataset_loader.reader import RowGroupReader
+
+    monkeypatch.setenv("HF_TOKEN", "hf_auth_secret_xyz")
+    reader = RowGroupReader()
+    try:
+        assert reader.token == "hf_auth_secret_xyz"
+        # Verify filesystem storage options contain Authorization header
+        assert reader._http_fs.kwargs.get("headers", {}).get("Authorization") == "Bearer hf_auth_secret_xyz"
+    finally:
+        reader.close()
+
+
+def test_row_group_reader_disabled_auth_with_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    from parquet_dataset_loader.reader import RowGroupReader
+
+    monkeypatch.setenv("HF_TOKEN", "hf_auth_secret_xyz")
+    reader = RowGroupReader(token=False)
+    try:
+        assert reader.token is None
+        assert "Authorization" not in reader._http_fs.kwargs.get("headers", {})
+    finally:
+        reader.close()
+
