@@ -53,11 +53,13 @@ class ProgressiveDiskSaver:
         split_name: str = "train",
         total_row_groups: int = 0,
         schema: Optional[pa.Schema] = None,
+        source_path: Optional[str] = None,
     ) -> None:
         self.target_dir = os.path.abspath(os.path.expanduser(target_dir))
         self.split_name = split_name
         self.total_row_groups = total_row_groups
         self.schema = schema
+        self.source_path = str(source_path) if source_path is not None else None
 
         self.rg_dir = os.path.join(self.target_dir, "row_groups", split_name)
         os.makedirs(self.rg_dir, exist_ok=True)
@@ -74,21 +76,55 @@ class ProgressiveDiskSaver:
         return os.path.join(self.rg_dir, f"rg_{file_idx:05d}_{rg_idx:05d}.feather")
 
     def _load_manifest(self) -> None:
-        """Load the list of previously saved row groups from disk."""
+        """Load previously saved row groups from disk and reconcile with disk state."""
+        needs_save = False
         if os.path.exists(self.manifest_file):
             try:
                 with open(self.manifest_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 saved = data.get("saved_row_groups", [])
                 self._saved_rgs = {tuple(item) for item in saved}  # type: ignore
+                if not self.source_path and data.get("source_path"):
+                    self.source_path = data.get("source_path")
+                if not self.total_row_groups and data.get("total_row_groups"):
+                    self.total_row_groups = data.get("total_row_groups")
             except Exception as e:
                 logger.warning("Could not read manifest file %s: %s", self.manifest_file, e)
+
+        # Reconcile disk state: discover any valid completed row groups and cleanup stale .tmp files
+        for d in [self.rg_dir, self.target_dir]:
+            if os.path.exists(d):
+                try:
+                    for fname in os.listdir(d):
+                        fpath = os.path.join(d, fname)
+                        if d == self.rg_dir and fname.startswith("rg_") and fname.endswith(".feather") and ".tmp." not in fname:
+                            base = fname[:-8]
+                            parts = base.split("_")
+                            if len(parts) == 3:
+                                try:
+                                    key = (int(parts[1]), int(parts[2]))
+                                    if key not in self._saved_rgs:
+                                        self._saved_rgs.add(key)
+                                        needs_save = True
+                                except ValueError:
+                                    pass
+                        elif ".tmp." in fname or fname.endswith(".tmp"):
+                            try:
+                                os.remove(fpath)
+                            except OSError:
+                                pass
+                except Exception as e:
+                    logger.warning("Error reconciling directory %s: %s", d, e)
+
+        if needs_save:
+            self._save_manifest()
 
     def _save_manifest(self) -> None:
         """Atomically persist the manifest of saved row groups."""
         tmp_file = f"{self.manifest_file}.tmp.{os.getpid()}_{threading.get_ident()}_{time.time_ns()}"
         payload = {
             "split_name": self.split_name,
+            "source_path": self.source_path,
             "total_row_groups": self.total_row_groups,
             "saved_count": len(self._saved_rgs),
             "is_complete": self.is_complete,
@@ -193,6 +229,7 @@ class ProgressiveDiskSaver:
         info_file = os.path.join(self.target_dir, f"{self.split_name}_info.json")
         info: Dict[str, Any] = {
             "split": self.split_name,
+            "source_path": self.source_path,
             "saved_row_groups": len(self._saved_rgs),
             "total_row_groups": self.total_row_groups,
             "is_complete": self.is_complete,
@@ -212,22 +249,28 @@ class BackgroundDownloader:
     """Asynchronous worker that downloads remaining row groups in the background.
 
     Runs in a background daemon thread while foreground operations stream data
-    without blocking.
+    without blocking. Prefetches forward from start_rg_index to optimize stream-from-index.
     """
 
     def __init__(
         self,
         reader: RowGroupReader,
         row_groups: Sequence[RowGroupInfo],
-        progressive_saver: ProgressiveDiskSaver,
+        progressive_saver: Optional[ProgressiveDiskSaver] = None,
+        saver: Optional[ProgressiveDiskSaver] = None,
         columns: Optional[Sequence[str]] = None,
         delay_between_requests: float = 0.02,
+        start_rg_index: int = 0,
     ) -> None:
         self.reader = reader
         self.row_groups = row_groups
-        self.progressive_saver = progressive_saver
+        actual_saver = progressive_saver or saver
+        if actual_saver is None:
+            raise ValueError("progressive_saver or saver must be provided")
+        self.progressive_saver = actual_saver
         self.columns = columns
         self.delay_between_requests = delay_between_requests
+        self.start_rg_index = max(0, min(start_rg_index, len(row_groups)))
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -245,28 +288,40 @@ class BackgroundDownloader:
         self._thread.start()
 
     def _run(self) -> None:
-        """Background worker loop."""
-        for rg in self.row_groups:
+        """Background worker loop with forward prefetching from start_rg_index."""
+        # Prioritize downloading forward from start_rg_index, then earlier row groups
+        if 0 < self.start_rg_index < len(self.row_groups):
+            ordered_rgs = list(self.row_groups[self.start_rg_index:]) + list(
+                self.row_groups[: self.start_rg_index]
+            )
+        else:
+            ordered_rgs = list(self.row_groups)
+
+        for rg in ordered_rgs:
             if self._stop_event.is_set():
                 break
 
+            file_idx = rg.file_index if hasattr(rg, "file_index") else rg[0]
+            rg_idx = rg.rg_index if hasattr(rg, "rg_index") else rg[1]
+            file_url = getattr(rg, "file_url", "")
+
             # If already saved by foreground thread or earlier run, skip
-            if self.progressive_saver.is_saved(rg.file_index, rg.rg_index):
+            if self.progressive_saver.is_saved(file_idx, rg_idx):
                 continue
 
             try:
                 # Reading triggers reader caching and progressive saving automatically
                 self.reader.read_row_group(
-                    file_url=rg.file_url,
-                    rg_index=rg.rg_index,
+                    file_url=file_url,
+                    rg_index=rg_idx,
                     columns=self.columns,
-                    file_index=rg.file_index,
+                    file_index=file_idx,
                 )
             except Exception as e:
                 logger.debug(
                     "Background download failed for row group (%d, %d): %s",
-                    rg.file_index,
-                    rg.rg_index,
+                    file_idx,
+                    rg_idx,
                     e,
                 )
 
@@ -281,6 +336,8 @@ class BackgroundDownloader:
         """Wait for the background worker thread to finish."""
         if self._thread is not None:
             self._thread.join(timeout=timeout)
+
+    wait = join
 
     @property
     def is_alive(self) -> bool:

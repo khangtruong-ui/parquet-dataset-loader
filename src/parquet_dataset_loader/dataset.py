@@ -80,6 +80,7 @@ class IndexedParquetDataset(collections.abc.Sequence):
         indices: Optional[Sequence[int]] = None,
         buffer_size: Optional[int] = None,
         seed: Optional[int] = None,
+        dataset_id: Optional[str] = None,
     ) -> None:
         self.index = index
         self.reader = reader
@@ -87,6 +88,9 @@ class IndexedParquetDataset(collections.abc.Sequence):
         self.background_downloader = background_downloader
         self.buffer_size = buffer_size
         self.seed = seed
+        self.dataset_id = dataset_id
+        self._dataset_id = dataset_id
+        self.is_closed = False
 
         if indices is not None:
             self.indices: Optional[List[int]] = list(indices)
@@ -580,11 +584,98 @@ class IndexedParquetDataset(collections.abc.Sequence):
 
         return self
 
+    @property
+    def status(self) -> Dict[str, Any]:
+        """Status summary for this dataset instance."""
+        return {
+            "dataset_id": self.dataset_id,
+            "split": self.split,
+            "num_rows": self._length,
+            "columns": self.column_names,
+            "offset": self.offset,
+            "is_shuffled": self.indices is not None,
+            "is_complete": self.is_fully_saved,
+            "save_progress": self.save_progress,
+            "background_downloading": (
+                self.background_downloader.is_alive
+                if self.background_downloader is not None
+                else False
+            ),
+            "is_closed": self.is_closed,
+        }
+
+    def __enter__(self) -> IndexedParquetDataset:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+    def start_background_download(
+        self,
+        start_index: Optional[int] = None,
+        delay_between_requests: float = 0.02,
+    ) -> Optional[Any]:
+        """Start or resume background prefetching/downloading to disk.
+
+        Prefetches forward starting from the row group of start_index.
+        Requires progressive disk saver to be configured (via save_to_disk).
+
+        Args:
+            start_index: Optional row index to begin forward prefetching from.
+            delay_between_requests: Pause in seconds between row group fetches.
+
+        Returns:
+            The BackgroundDownloader instance, or None if save_to_disk is not enabled.
+        """
+        if self.progressive_saver is None:
+            return None
+
+        if self.background_downloader is not None and self.background_downloader.is_alive:
+            return self.background_downloader
+
+        start_rg_idx = 0
+        if start_index is not None and start_index > 0:
+            eff_start = self.offset + start_index
+            rg_info, _ = self.index.locate_row(min(eff_start, max(0, self.index.total_rows - 1)))
+            for i, rg in enumerate(self.index.row_groups):
+                if rg.file_index == rg_info.file_index and rg.rg_index == rg_info.rg_index:
+                    start_rg_idx = i
+                    break
+
+        from parquet_dataset_loader.progressive import BackgroundDownloader
+
+        self.background_downloader = BackgroundDownloader(
+            reader=self.reader,
+            row_groups=self.index.row_groups,
+            progressive_saver=self.progressive_saver,
+            columns=self.columns,
+            delay_between_requests=delay_between_requests,
+            start_rg_index=start_rg_idx,
+        )
+        self.background_downloader.start()
+        return self.background_downloader
+
+    def stop_background_download(self) -> None:
+        """Stop any active background downloader worker thread."""
+        if self.background_downloader is not None:
+            self.background_downloader.stop()
+
     def close(self) -> None:
         """Stop any background downloader and close open reader handles."""
+        if self.is_closed:
+            return
+        self.is_closed = True
         if self.background_downloader is not None:
             self.background_downloader.stop()
         self.reader.close()
+
+        # Unregister from dataset manager if registered
+        if self.dataset_id:
+            try:
+                from parquet_dataset_loader.manager import get_dataset_manager
+                get_dataset_manager().unregister(self.dataset_id)
+            except Exception:
+                pass
 
     def to_pandas(self) -> Any:
         """Materialize this dataset view as a pandas DataFrame."""
@@ -628,6 +719,8 @@ class IndexedParquetDataset(collections.abc.Sequence):
         extra = ""
         if self.indices is not None:
             extra = ",\n  shuffled: True"
+        if self.dataset_id is not None:
+            extra += f",\n  id: '{self.dataset_id}'"
         return (
             f"IndexedParquetDataset(\n"
             f"  split: '{self.split}',\n"
@@ -643,8 +736,17 @@ class ParquetDatasetDict(dict):
     Mirrors Hugging Face's DatasetDict behavior and interfaces.
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, dataset_id: Optional[str] = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self.dataset_id = dataset_id
+        self._dataset_id = dataset_id
+        self._is_closed = False
+
+    @property
+    def is_closed(self) -> bool:
+        if self._is_closed:
+            return True
+        return all(getattr(ds, "is_closed", False) for ds in self.values()) if self else False
 
     def select_columns(self, columns: Sequence[str]) -> ParquetDatasetDict:
         """Apply column projection to all splits in the dictionary."""
@@ -695,6 +797,35 @@ class ParquetDatasetDict(dict):
         for split, ds in self.items():
             split_dir = os.path.join(target_dir, split)
             ds.save_to_disk(split_dir)
+
+    def __enter__(self) -> ParquetDatasetDict:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Close all split datasets and release resources."""
+        self._is_closed = True
+        for ds in self.values():
+            if hasattr(ds, "close"):
+                ds.close()
+        ds_id = getattr(self, "dataset_id", None) or getattr(self, "_dataset_id", None)
+        if ds_id:
+            try:
+                from parquet_dataset_loader.manager import get_dataset_manager
+                get_dataset_manager().unregister(ds_id)
+            except Exception:
+                pass
+
+    @property
+    def status(self) -> Dict[str, Any]:
+        """Status summary for all splits in this dataset dictionary."""
+        return {
+            "dataset_id": getattr(self, "dataset_id", None) or getattr(self, "_dataset_id", None),
+            "is_closed": self.is_closed,
+            "splits": {k: v.status if hasattr(v, "status") else {} for k, v in self.items()},
+        }
 
     def __repr__(self) -> str:
         splits_str = ",\n".join(

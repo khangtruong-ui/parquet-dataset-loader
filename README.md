@@ -3,7 +3,7 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Tests: Pytest](https://img.shields.io/badge/tests-passing-brightgreen.svg)](tests/)
-[![Version: 0.2.2](https://img.shields.io/badge/version-0.2.2-orange.svg)](pyproject.toml)
+[![Version: 0.3.0](https://img.shields.io/badge/version-0.3.0-orange.svg)](pyproject.toml)
 
 A high-performance, memory-efficient Python library dedicated to loading large Parquet datasets from Hugging Face Hub and local storage. Featuring **instant random-access index-based streaming** without downloading multi-gigabyte or terabyte files to disk.
 
@@ -291,7 +291,119 @@ offline_ds = pdl.load_from_disk("./coco_archive")
 print(len(offline_ds))
 ```
 
-### 10. Hugging Face Authentication & High Quotas (`HF_TOKEN`)
+### 10. Stream-from-Index + Forward Background Downloading (Prefetching)
+
+When you resume training or evaluate a slice from an offset using `start_index` (or `from_index`), background downloading automatically prioritizes row groups **forward from your start index**:
+
+```
+Dataset Total Rows: [ RG 0 ] [ RG 1 ] [ RG 2 ] [ RG 3 ] [ RG 4 ] [ RG 5 ]
+Consumer start_index ───────────────► [Starts at RG 2]
+Background Worker Download Order:    (1st)    (2nd)    (3rd)    (4th) ──┐
+                                     RG 2  ─► RG 3  ─► RG 4  ─► RG 5   │
+                                  ┌────────────────────────────────────┘
+                                  ▼ (Wrap around for offline completeness)
+                                 (5th)   (6th)
+                                 RG 0 ─► RG 1
+```
+
+```python
+# Starts streaming at row index 50,000 while prefetching forward from RG containing row 50,000
+ds = pdl.load_dataset(
+    "KhangTruong/COCO-inpainted",
+    split="train",
+    streaming=True,
+    start_index=50000,
+    save_to_disk="./coco_stream_prefetch",
+    background_download=True,
+)
+
+# Row 50,000 is available instantly, and upcoming rows (50,001+) are prefetched ahead in RAM/disk
+print(ds[0])  # Accesses relative row 0 (global row 50,000)
+
+# Dynamic control over background prefetcher:
+ds.stop_background_download()
+ds.start_background_download(start_index=60000)
+```
+
+---
+
+### 11. Resuming Incomplete Progressive Datasets on Disk
+
+If training or downloading is interrupted (e.g. spot instance preemption, network disconnect, or process termination), progressive saves are **never corrupted**:
+1. **Atomic File Writes**: Row groups are saved atomically via `.tmp` files and committed only when fully validated.
+2. **Disk Reconciliation**: On reload, `ProgressiveDiskSaver` sweeps the directory, discovers all valid completed `.feather` row groups, and purges orphaned `.tmp` files.
+3. **Seamless Remote Resumption**: Manifest files store the upstream repo `source_path`. Resuming unblocks streaming immediately while downloading only the missing row groups.
+
+```python
+# Option A: Universal resume_dataset() helper
+ds_resumed = pdl.resume_dataset(
+    dataset_path="./coco_partial_archive",
+    background_download=True,  # Finishes missing row groups in background
+)
+
+# Option B: load_from_disk with resume=True (default is True)
+ds_resumed = pdl.load_from_disk(
+    "./coco_partial_archive",
+    resume=True,
+    background_download=True,
+)
+
+# Access any row immediately (saved rows load from disk; unsaved stream from remote)
+sample = ds_resumed[1000]
+
+# If you only want to load already-downloaded local rows without touching the network:
+ds_offline = pdl.load_from_disk("./coco_partial_archive", allow_incomplete=True, resume=False)
+```
+
+---
+
+### 12. Multiple Dataset Instance Management (`DatasetManager`)
+
+When training multi-modal architectures or running joint evaluation, you often instantiate multiple datasets (e.g. `ds_train`, `ds_val`, `ds_labels`). `parquet-dataset-loader` provides a centralized, thread-safe **lifecycle registry**:
+
+- **Automatic Registration**: Datasets created via `load_dataset` or `load_from_disk` are tracked in the global `DatasetManager`.
+- **Introspection**: Inspect active datasets, download progress, row counts, and memory caches with `pdl.list_active_datasets()`.
+- **Clean Teardown**: Stop all background threads, close open reader file descriptors, and release memory with `close_all_datasets()` or `ds.close()`.
+
+```python
+import parquet_dataset_loader as pdl
+
+# Create multiple managed datasets with explicit or auto-assigned IDs
+ds1 = pdl.load_dataset("repo1", split="train", streaming=True, dataset_id="ds_train")
+ds2 = pdl.load_dataset("repo2", split="validation", streaming=True, dataset_id="ds_val")
+
+# Introspect all active datasets across your process:
+active = pdl.list_active_datasets()
+for ds_id, status in active.items():
+    print(f"ID: {ds_id} | Rows: {status['num_rows']:,} | Background Worker: {status['background_downloading']}")
+
+# Clean up individually:
+ds1.close()
+assert ds1.is_closed
+
+# Or clean up all datasets in one call:
+pdl.close_all_datasets()
+```
+
+#### Scoped Lifecycles with Context Managers
+
+```python
+# Scoped Dataset context:
+with pdl.load_dataset("repo1", split="train", streaming=True) as ds:
+    train_step(ds[0])
+# ds is automatically closed, and background downloaders stopped!
+
+# Multi-dataset scoped block:
+with pdl.managed_datasets() as mgr:
+    ds_a = pdl.load_dataset("repo_a", streaming=True)
+    ds_b = pdl.load_dataset("repo_b", streaming=True)
+    evaluate(ds_a, ds_b)
+# All datasets registered inside this block are cleanly closed upon exit!
+```
+
+---
+
+### 13. Hugging Face Authentication & High Quotas (`HF_TOKEN`)
 
 Authenticated Hugging Face accounts benefit from significantly higher rate limits, increased download throughput, and access to private or gated repositories. `parquet-dataset-loader` seamlessly supports authentication:
 
@@ -372,6 +484,8 @@ def load_dataset(
     buffer_size: Optional[int] = None,
     start_index: Optional[int] = None,
     from_index: Optional[int] = None,
+    dataset_id: Optional[str] = None,
+    manage: bool = True,
     **kwargs,
 ) -> Union[IndexedParquetDataset, ParquetDatasetDict]
 ```
@@ -382,23 +496,69 @@ def load_dataset(
 - **`shuffle`**: If `True` (or if `seed` is passed without `shuffle=False`), enables deterministic shuffling. Supported with both streaming and non-streaming.
 - **`seed`**: Integer seed for 100% reproducible shuffling.
 - **`buffer_size`**: Optional buffer size for streaming buffer-based shuffle.
-- **`start_index` / `from_index`**: Row index to start/resume streaming from (0-indexed). Supported in both streaming and non-streaming.
+- **`start_index` / `from_index`**: Row index to start/resume streaming from (0-indexed). Forward background prefetching automatically prioritizes row groups starting from this index.
 - **`save_to_disk`**: Path string or `True`. Enables progressive saving to disk while streaming immediately without blocking.
 - **`background_download`**: If `True`, starts a background worker thread to prefetch and archive remaining row groups to disk.
+- **`dataset_id`**: Optional unique name to register this dataset with `DatasetManager`.
+- **`manage`**: Whether to register instance with `DatasetManager` (default `True`).
 - **`columns`**: Column projection list.
 - **`max_cached_row_groups`**: Number of decoded row group tables to keep in RAM simultaneously (default `2`).
 - **`disk_cache`**: If `True`, caches fetched row groups to SSD in Feather format for sub-millisecond repeated reads.
 - **`max_workers`**: Concurrency level for metadata indexing or file downloads.
 - **`show_progress`**: Whether to display progress bars.
 
-### `load_from_disk(dataset_path, columns=None, shuffle=None, seed=None, start_index=None, ...)`
-Reloads a dataset or multi-split dataset directory saved via `dataset.save_to_disk(...)`.
+### `load_from_disk(...)`
+
+```python
+def load_from_disk(
+    dataset_path: str,
+    columns: Optional[Sequence[str]] = None,
+    shuffle: Optional[bool] = None,
+    seed: Optional[int] = None,
+    buffer_size: Optional[int] = None,
+    start_index: Optional[int] = None,
+    from_index: Optional[int] = None,
+    resume: bool = True,
+    allow_incomplete: bool = True,
+    background_download: bool = False,
+    token: Optional[Union[bool, str]] = None,
+    dataset_id: Optional[str] = None,
+    manage: bool = True,
+    **kwargs,
+) -> Union[IndexedParquetDataset, ParquetDatasetDict]
+```
+
+### `resume_dataset(...)`
+
+```python
+def resume_dataset(
+    dataset_path: str,
+    source_path: Optional[str] = None,
+    split: Optional[str] = None,
+    background_download: bool = True,
+    columns: Optional[Sequence[str]] = None,
+    token: Optional[Union[bool, str]] = None,
+    dataset_id: Optional[str] = None,
+    manage: bool = True,
+    **kwargs,
+) -> Union[IndexedParquetDataset, ParquetDatasetDict]
+```
+
+### Lifecycle Functions & `DatasetManager`
+
+- **`get_dataset_manager()`**: Access the global `DatasetManager` singleton instance.
+- **`list_active_datasets()`**: Return dictionary mapping active dataset IDs to status metadata.
+- **`close_all_datasets()`**: Stop background workers and close all open datasets across the process.
+- **`managed_datasets()`**: Context manager ensuring all datasets created inside are closed on block exit.
+- **`dataset.status`**: Dictionary containing `dataset_id`, `split`, `num_rows`, `save_progress`, `background_downloading`, and `is_closed`.
+- **`dataset.close()`**: Cleanly unregister dataset and terminate any background worker.
+- **`dataset.start_background_download(start_index=...)`** / **`dataset.stop_background_download()`**: Dynamically control prefetching workers.
 
 ---
 
 ## Running Tests
 
-The test suite contains 59 comprehensive unit and integration tests:
+The test suite contains 68 comprehensive unit and integration tests:
 
 ```bash
 # Run unit tests (offline, fast)
@@ -414,16 +574,30 @@ pytest
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+### Version 0.3.0
+- **Multiple Dataset Instance Management (`DatasetManager`)**:
+  - Centralized thread-safe registry tracking active dataset instances (`ds1`, `ds2`) with unique IDs.
+  - Added `get_dataset_manager()`, `list_active_datasets()`, and `close_all_datasets()`.
+  - Added `managed_datasets()` and dataset context manager protocol (`with load_dataset(...) as ds:`).
+  - Added `status`, `is_closed`, and clean `close()` methods releasing background threads and file descriptors.
+- **Stream-from-Index + Forward Background Downloading**:
+  - `BackgroundDownloader` prioritizes prefetching row groups forward from `start_index` before wrapping around to earlier row groups.
+  - Added dynamic prefetch controls: `ds.start_background_download(start_index=...)` and `ds.stop_background_download()`.
+- **Incomplete Dataset Resumption & Disk Reconciliation**:
+  - Added `resume_dataset(...)` top-level function for resuming partially-saved datasets.
+  - Enhanced `load_from_disk(..., resume=True)` to reconnect to remote sources automatically.
+  - Added disk reconciliation in `ProgressiveDiskSaver`: auto-discovers completed `.feather` row groups even if manifests were interrupted, and cleans up orphaned `.tmp` files.
+- **9 New Tests & Runnable Example**:
+  - Added `tests/test_manager_and_resume.py` (68 total passing tests).
+  - Added `examples/manager_and_resume_example.py`.
+
 ### Version 0.2.2
-- **Reproducible Shuffling with Seed**: Added `shuffle` and `seed` support to `load_dataset`, `IndexedParquetDataset.shuffle(seed=...)`, and `ParquetDatasetDict.shuffle(seed=...)`. Fully supported across both streaming and non-streaming modes with 100% deterministic reproducibility.
-- **Streaming from Index**: Added `start_index` and `from_index` parameter to `load_dataset`, as well as `ds.iter_from(start_index)` and `ds.stream(start_index)`. Enables instant seek and checkpoint resuming on both unshuffled and shuffled datasets.
-- **Streaming Buffer Shuffle**: Added `buffer_size` support to `shuffle(seed=..., buffer_size=...)` for rolling buffer-based random streaming.
-- **Batch & Arrow Shuffled Materialization**: Optimized row-group-grouped extraction in `to_arrow()`, `to_pandas()`, `to_hf_dataset()`, and `save_to_disk()` for shuffled views.
+- **Reproducible Shuffling with Seed**: Added `shuffle` and `seed` support to `load_dataset`, `IndexedParquetDataset.shuffle(seed=...)`, and `ParquetDatasetDict.shuffle(seed=...)`.
+- **Streaming from Index**: Added `start_index` and `from_index` parameter to `load_dataset`, as well as `ds.iter_from(start_index)` and `ds.stream(start_index)`.
+- **Streaming Buffer Shuffle**: Added `buffer_size` support to `shuffle(seed=..., buffer_size=...)`.
 
 ### Version 0.2.1
-- **Full Hugging Face Authentication Support (`HF_TOKEN`)**:
-  - Added automatic resolution and propagation of authentication tokens (`HF_TOKEN`, Colab secrets, login cache).
-  - Fixed LRU file handle eviction in `RowGroupReader`.
+- **Full Hugging Face Authentication Support (`HF_TOKEN`)**: Automatic resolution and propagation of authentication tokens (`HF_TOKEN`, Colab secrets, login cache).
 
 ### Version 0.2.0
 - Simultaneous Streaming + Save-to-Disk with `ProgressiveDiskSaver` and `BackgroundDownloader`.

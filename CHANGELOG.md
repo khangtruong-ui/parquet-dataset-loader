@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-07
+
+### Added
+- **Multiple Dataset Instance Management (`DatasetManager`)**:
+  - Centralized, thread-safe lifecycle registry (`DatasetManager`) tracking all active dataset instances (`IndexedParquetDataset` and `ParquetDatasetDict`).
+  - Added `dataset_id` tracking, with automatic disambiguation on ID collisions (e.g. `ds_name_1`).
+  - Exposed module-level lifecycle controls:
+    - `get_dataset_manager()`: Access the global registry singleton.
+    - `list_active_datasets()`: Return status dictionaries (row count, columns, download progress, cache states, background workers).
+    - `close_all_datasets()`: Coordinated shutdown of all active datasets, file descriptors, and worker threads.
+    - `managed_datasets()`: Context manager ensuring all datasets created inside are cleanly unmounted and closed upon exit.
+  - Added context manager protocol to `IndexedParquetDataset` and `ParquetDatasetDict` (`with load_dataset(...) as ds:`).
+  - Added `status` and `is_closed` properties and explicit `close()` method to dataset classes.
+- **Stream-from-Index + Forward Background Downloading**:
+  - Updated `BackgroundDownloader` with `start_rg_index`: prioritized prefetching downloads forward from the row group of `start_index` to optimize upcoming reads, before wrapping around to earlier row groups.
+  - Added dynamic worker controls: `ds.start_background_download(start_index=...)` and `ds.stop_background_download()`.
+- **Incomplete Dataset Resumption & Disk Reconciliation**:
+  - Manifest format now records upstream repository `source_path` and `total_row_groups`.
+  - Added disk reconciliation to `ProgressiveDiskSaver`: discovers already-saved `.feather` row groups on disk (recovering from lost manifests) and cleans up stale `.tmp` files.
+  - Added `resume_dataset(dataset_path, ...)` top-level function.
+  - Added `resume=True` and `allow_incomplete=True` support to `load_from_disk(...)`.
+- **Unit Tests and Documentation**:
+  - Added `tests/test_manager_and_resume.py` with 9 unit tests verifying multi-instance tracking, prefetching priority, disk recovery, and resumption.
+  - Added `examples/manager_and_resume_example.py` runnable demonstration script.
+  - Full test suite now consists of 68 passing unit and integration tests.
+
 ## [0.2.2] - 2026-10-07
 
 ### Added

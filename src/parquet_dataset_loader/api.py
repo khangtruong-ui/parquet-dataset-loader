@@ -7,6 +7,8 @@ This module exposes:
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 from typing import (
     Any,
@@ -36,8 +38,17 @@ from parquet_dataset_loader.hf_resolver import (
     resolve_parquet_dataset,
 )
 from parquet_dataset_loader.index import build_metadata_index
+from parquet_dataset_loader.manager import (
+    DatasetManager,
+    close_all_datasets,
+    get_dataset_manager,
+    list_active_datasets,
+    managed_datasets,
+)
 from parquet_dataset_loader.progressive import BackgroundDownloader, ProgressiveDiskSaver
 from parquet_dataset_loader.reader import RowGroupReader, download_parquet_files
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_CACHE_DIR = os.path.expanduser("~/.cache/parquet_dataset_loader")
 
@@ -64,6 +75,8 @@ def load_dataset(
     buffer_size: Optional[int] = None,
     start_index: Optional[int] = None,
     from_index: Optional[int] = None,
+    dataset_id: Optional[str] = None,
+    manage: bool = True,
     **kwargs: Any,
 ) -> Union[IndexedParquetDataset, ParquetDatasetDict]:
     """Load a Parquet dataset from Hugging Face Hub, local files, or remote URLs.
@@ -213,6 +226,7 @@ def load_dataset(
                 split_name=s,
                 total_row_groups=len(index.row_groups),
                 schema=index.schema,
+                source_path=path if isinstance(path, str) else None,
             )
 
         reader = RowGroupReader(
@@ -224,20 +238,32 @@ def load_dataset(
 
         bg_downloader: Optional[BackgroundDownloader] = None
         if background_download and prog_saver is not None:
+            start_rg_idx = 0
+            if eff_start_index is not None and eff_start_index > 0:
+                target_row = min(eff_start_index, max(0, index.total_rows - 1))
+                rg_info, _ = index.locate_row(target_row)
+                for i_rg, rg_item in enumerate(index.row_groups):
+                    if rg_item.file_index == rg_info.file_index and rg_item.rg_index == rg_info.rg_index:
+                        start_rg_idx = i_rg
+                        break
+
             bg_downloader = BackgroundDownloader(
                 reader=reader,
                 row_groups=index.row_groups,
                 progressive_saver=prog_saver,
                 columns=columns,
+                start_rg_index=start_rg_idx,
             )
             bg_downloader.start()
 
+        ds_instance_id = f"{dataset_id}_{s}" if dataset_id and base_split is None else dataset_id
         ds = IndexedParquetDataset(
             index=index,
             reader=reader,
             columns=columns,
             split=s,
             background_downloader=bg_downloader,
+            dataset_id=ds_instance_id,
         )
 
         # Apply split slice if requested (e.g. 'train[:1000]')
@@ -258,9 +284,14 @@ def load_dataset(
         datasets[s] = ds
 
     if base_split is not None:
-        return datasets[base_split]
+        result_ds: Union[IndexedParquetDataset, ParquetDatasetDict] = datasets[base_split]
+    else:
+        result_ds = ParquetDatasetDict(datasets, dataset_id=dataset_id)
 
-    return ParquetDatasetDict(datasets)
+    if manage:
+        get_dataset_manager().register(result_ds, dataset_id=dataset_id)
+
+    return result_ds
 
 
 def load_from_disk(
@@ -271,9 +302,18 @@ def load_from_disk(
     buffer_size: Optional[int] = None,
     start_index: Optional[int] = None,
     from_index: Optional[int] = None,
+    resume: bool = True,
+    allow_incomplete: bool = True,
+    background_download: bool = False,
+    token: Optional[Union[bool, str]] = None,
+    dataset_id: Optional[str] = None,
+    manage: bool = True,
     **kwargs: Any,
 ) -> Union[IndexedParquetDataset, ParquetDatasetDict]:
     """Load a dataset previously saved to disk via save_to_disk().
+
+    Supports resuming incomplete downloads and progressive saves, either by
+    reconnecting to the original source or loading the available local rows.
 
     Args:
         dataset_path: Path to the directory containing saved dataset files.
@@ -283,6 +323,13 @@ def load_from_disk(
         buffer_size: Optional buffer size for streaming buffer shuffle.
         start_index: Optional row index to stream from.
         from_index: Alias for start_index.
+        resume: If True and the dataset on disk is incomplete with a recorded source,
+            automatically resumes streaming and completing missing row groups.
+        allow_incomplete: If True, allows loading available local rows even if incomplete.
+        background_download: If resuming, whether to download remaining rows in background.
+        token: Optional auth token.
+        dataset_id: Optional unique identifier for DatasetManager.
+        manage: Whether to register with DatasetManager.
         **kwargs: Additional parameters passed to load_dataset.
 
     Returns:
@@ -309,17 +356,69 @@ def load_from_disk(
                 buffer_size=buffer_size,
                 start_index=start_index,
                 from_index=from_index,
+                resume=resume,
+                allow_incomplete=allow_incomplete,
+                background_download=background_download,
+                token=token,
+                manage=False,
                 **kwargs,
             )  # type: ignore
-        return ParquetDatasetDict(splits_dict)
+        dict_res = ParquetDatasetDict(splits_dict)
+        if manage:
+            get_dataset_manager().register(dict_res, dataset_id=dataset_id)
+        return dict_res
 
     # Check if this is a progressive save directory with row_groups/
     rg_dir = os.path.join(abs_path, "row_groups")
     if os.path.exists(rg_dir):
+        manifest_files = [f for f in entries if f.endswith("_manifest.json")]
+        split_name = (
+            manifest_files[0].replace("_manifest.json", "")
+            if manifest_files
+            else "train"
+        )
+        is_complete = False
+        source_path = None
+        if manifest_files:
+            try:
+                with open(os.path.join(abs_path, manifest_files[0]), "r", encoding="utf-8") as f:
+                    mdata = json.load(f)
+                is_complete = mdata.get("is_complete", False)
+                source_path = mdata.get("source_path")
+            except Exception:
+                pass
+
+        # If incomplete and resume requested with known source, resume from remote!
+        if not is_complete and resume and source_path:
+            logger.info("Resuming incomplete dataset from source '%s' to '%s'", source_path, abs_path)
+            return load_dataset(
+                path=source_path,
+                split=split_name,
+                streaming=True,
+                save_to_disk=abs_path,
+                columns=columns,
+                shuffle=shuffle,
+                seed=seed,
+                buffer_size=buffer_size,
+                start_index=start_index,
+                from_index=from_index,
+                background_download=background_download,
+                token=token,
+                dataset_id=dataset_id,
+                manage=manage,
+                **kwargs,
+            )
+
+        if not is_complete and not allow_incomplete:
+            raise ParquetDatasetError(
+                f"Incomplete progressive dataset at '{dataset_path}' has not finished saving. "
+                "Set resume=True to finish downloading from source, or allow_incomplete=True to load partial rows."
+            )
+
         rg_files = []
         for root, _, files in os.walk(rg_dir):
             for f in sorted(files):
-                if f.endswith(".feather"):
+                if f.endswith(".feather") and ".tmp." not in f:
                     rg_files.append(os.path.join(root, f))
         rg_files.sort()
         if rg_files:
@@ -336,12 +435,6 @@ def load_from_disk(
                 table = pa.Table.from_batches([], schema=schema or pa.schema([]))
             else:
                 table = pa.Table.from_batches(batches, schema=schema)
-            manifest_files = [f for f in entries if f.endswith("_manifest.json")]
-            split_name = (
-                manifest_files[0].replace("_manifest.json", "")
-                if manifest_files
-                else "train"
-            )
             tmp_parquet = os.path.join(abs_path, f"{split_name}.parquet")
             pq.write_table(table, tmp_parquet, compression="snappy")
             return load_dataset(
@@ -354,6 +447,8 @@ def load_from_disk(
                 buffer_size=buffer_size,
                 start_index=start_index,
                 from_index=from_index,
+                dataset_id=dataset_id,
+                manage=manage,
                 **kwargs,
             )
 
@@ -386,5 +481,77 @@ def load_from_disk(
         buffer_size=buffer_size,
         start_index=start_index,
         from_index=from_index,
+        dataset_id=dataset_id,
+        manage=manage,
+        **kwargs,
+    )
+
+
+def resume_dataset(
+    dataset_path: str,
+    source_path: Optional[str] = None,
+    split: Optional[str] = None,
+    background_download: bool = True,
+    columns: Optional[Sequence[str]] = None,
+    token: Optional[Union[bool, str]] = None,
+    dataset_id: Optional[str] = None,
+    manage: bool = True,
+    **kwargs: Any,
+) -> Union[IndexedParquetDataset, ParquetDatasetDict]:
+    """Resume saving/downloading an incomplete dataset on disk.
+
+    Reads the saved manifest to identify the source and missing row groups,
+    then unblocks streaming immediately while downloading remaining data in background.
+
+    Args:
+        dataset_path: Path to the local incomplete dataset directory.
+        source_path: Optional source repo ID or URL override.
+        split: Optional split name override.
+        background_download: Whether to prefetch remaining row groups in background.
+        columns: Optional column projection list.
+        token: Optional auth token.
+        dataset_id: Optional dataset instance ID.
+        manage: Whether to register with DatasetManager.
+        **kwargs: Additional parameters passed to load_dataset.
+
+    Returns:
+        IndexedParquetDataset or ParquetDatasetDict resuming download and streaming.
+    """
+    abs_path = os.path.abspath(os.path.expanduser(dataset_path))
+    if not os.path.exists(abs_path):
+        raise DatasetNotFoundError(dataset_path, "Directory does not exist.")
+
+    entries = os.listdir(abs_path)
+    manifest_files = [f for f in entries if f.endswith("_manifest.json")]
+    detected_split = split
+    detected_source = source_path
+
+    if manifest_files:
+        if not detected_split:
+            detected_split = manifest_files[0].replace("_manifest.json", "")
+        if not detected_source:
+            try:
+                with open(os.path.join(abs_path, manifest_files[0]), "r", encoding="utf-8") as f:
+                    mdata = json.load(f)
+                detected_source = mdata.get("source_path")
+            except Exception:
+                pass
+
+    if not detected_source:
+        raise ParquetDatasetError(
+            f"Cannot resume dataset at '{dataset_path}': no source_path found in manifest. "
+            "Please provide source_path explicitly."
+        )
+
+    return load_dataset(
+        path=detected_source,
+        split=detected_split,
+        streaming=True,
+        save_to_disk=abs_path,
+        background_download=background_download,
+        columns=columns,
+        token=token,
+        dataset_id=dataset_id,
+        manage=manage,
         **kwargs,
     )
