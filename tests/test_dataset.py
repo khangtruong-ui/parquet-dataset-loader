@@ -186,3 +186,37 @@ def test_dataset_pickle_and_multiprocessing(sample_dataset: IndexedParquetDatase
     assert restored[0]["id"] == sample_dataset[0]["id"]
     assert restored[99]["id"] == sample_dataset[99]["id"]
 
+
+def test_dataset_select_and_shard(sample_dataset: IndexedParquetDataset) -> None:
+    ds = sample_dataset
+    assert ds.n_shards == 2
+
+    # select arbitrary indices
+    sub = ds.select([0, 10, 50, 99])
+    assert len(sub) == 4
+    assert sub[0]["id"] == 0
+    assert sub[1]["id"] == 10
+    assert sub[2]["id"] == 50
+    assert sub[3]["id"] == 99
+
+    # contiguous shard
+    shard0 = ds.shard(num_shards=2, index=0, contiguous=True)
+    shard1 = ds.shard(num_shards=2, index=1, contiguous=True)
+    assert len(shard0) == 50
+    assert len(shard1) == 50
+    assert shard0[0]["id"] == 0
+    assert shard0[-1]["id"] == 49
+    assert shard1[0]["id"] == 50
+    assert shard1[-1]["id"] == 99
+
+    # interleaved shard
+    i_shard0 = ds.shard(num_shards=4, index=0, contiguous=False)
+    i_shard1 = ds.shard(num_shards=4, index=1, contiguous=False)
+    assert len(i_shard0) == 25
+    assert len(i_shard1) == 25
+    assert i_shard0[0]["id"] == 0
+    assert i_shard0[1]["id"] == 4
+    assert i_shard1[0]["id"] == 1
+    assert i_shard1[1]["id"] == 5
+
+

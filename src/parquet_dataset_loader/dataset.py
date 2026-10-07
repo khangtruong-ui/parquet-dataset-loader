@@ -469,6 +469,67 @@ class IndexedParquetDataset(collections.abc.Sequence):
             seed=self.seed,
         )
 
+    @property
+    def n_shards(self) -> int:
+        """Number of underlying Parquet files / shards."""
+        return len(self.index.files)
+
+    def select(self, indices: Sequence[int]) -> IndexedParquetDataset:
+        """Create a new dataset view containing only the specified row indices.
+
+        Args:
+            indices: Sequence of row indices relative to this view.
+
+        Returns:
+            A new IndexedParquetDataset view.
+        """
+        base_indices = (
+            list(self.indices)
+            if self.indices is not None
+            else [self.offset + i for i in range(self._length)]
+        )
+        selected_indices = [base_indices[i] for i in indices]
+        return IndexedParquetDataset(
+            index=self.index,
+            reader=self.reader,
+            columns=self.columns,
+            indices=selected_indices,
+            split=self.split,
+            background_downloader=self.background_downloader,
+            buffer_size=self.buffer_size,
+            seed=self.seed,
+            dataset_id=self.dataset_id,
+        )
+
+    def shard(
+        self,
+        num_shards: int,
+        index: int,
+        contiguous: bool = False,
+    ) -> IndexedParquetDataset:
+        """Shard the dataset into deterministic partitions across distributed ranks or workers.
+
+        Args:
+            num_shards: Total number of shards (e.g. world_size or num_workers).
+            index: Current shard index (0 to num_shards - 1).
+            contiguous: Whether to create contiguous slices or interleaved strides (default: False).
+
+        Returns:
+            An IndexedParquetDataset view for the specified shard.
+        """
+        if num_shards <= 0:
+            raise ValueError(f"num_shards must be positive, got {num_shards}")
+        if index < 0 or index >= num_shards:
+            raise ValueError(f"index must be in range [0, {num_shards - 1}], got {index}")
+
+        if contiguous:
+            start = index * (self._length // num_shards) + min(index, self._length % num_shards)
+            end = (index + 1) * (self._length // num_shards) + min(index + 1, self._length % num_shards)
+            return self.slice(start, max(0, end - start))
+
+        indices = range(index, self._length, num_shards)
+        return self.select(indices)
+
     def to_arrow(self, batch_size: int = 1000) -> pa.Table:
         """Materialize this dataset view as an in-memory PyArrow Table.
 
