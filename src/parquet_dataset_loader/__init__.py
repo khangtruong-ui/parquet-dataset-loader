@@ -44,7 +44,7 @@ from parquet_dataset_loader.manager import (
 from parquet_dataset_loader.progressive import BackgroundDownloader, ProgressiveDiskSaver
 from parquet_dataset_loader.reader import RowGroupReader, download_parquet_files
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 __all__ = [
     "__version__",
     "DEFAULT_CACHE_DIR",

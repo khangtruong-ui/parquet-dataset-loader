@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-10-07
+
+### Added
+- **PyTorch DataLoader Multiprocessing & Multi-Worker Compatibility**:
+  - Added `__getstate__` and `__setstate__` to `IndexedParquetDataset`, `RowGroupMemoryCache`, `DiskCache`, `RowGroupReader`, `ProgressiveDiskSaver`, and `DatasetManager`.
+  - Enables clean child process serialization with PyTorch `DataLoader(num_workers > 0)` and `spawn` / `fork` multiprocessing contexts, resolving `TypeError: cannot pickle '_thread.lock' object`.
+- **Distributed Sharding & Slicing (`shard` and `n_shards`)**:
+  - Added `ds.shard(num_shards, index, contiguous=False)` to `IndexedParquetDataset` for DistributedDataParallel (DDP) rank sharding and worker partitioning.
+  - Added `ds.n_shards` property returning the number of underlying Parquet files in the split.
+- **Arbitrary Index Selection (`select`)**:
+  - Added `ds.select(indices)` to `IndexedParquetDataset` returning a zero-copy index view.
+- **Documentation & Reference Table**:
+  - Added comprehensive PyTorch DataLoader multi-worker usage examples to `README.md`.
+  - Added full default parameter reference table for `load_dataset(...)` in `README.md`.
+
 ## [0.3.1] - 2026-10-07
 
 ### Added

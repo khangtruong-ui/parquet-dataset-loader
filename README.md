@@ -3,7 +3,7 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Tests: Pytest](https://img.shields.io/badge/tests-passing-brightgreen.svg)](tests/)
-[![Version: 0.3.0](https://img.shields.io/badge/version-0.3.0-orange.svg)](pyproject.toml)
+[![Version: 0.3.2](https://img.shields.io/badge/version-0.3.2-orange.svg)](pyproject.toml)
 
 A high-performance, memory-efficient Python library dedicated to loading large Parquet datasets from Hugging Face Hub and local storage. Featuring **instant random-access index-based streaming** without downloading multi-gigabyte or terabyte files to disk.
 
@@ -438,8 +438,9 @@ Authentication headers (`Authorization: Bearer <token>`) are automatically appli
 
 ## PyTorch DataLoader Integration
 
-Because `IndexedParquetDataset` implements standard Python sequence protocols (`__len__` and `__getitem__`), you can plug it straight into PyTorch `DataLoader` — including with deterministic shuffling:
+Because `IndexedParquetDataset` implements standard Python sequence protocols (`__len__` and `__getitem__`), you can plug it straight into PyTorch `DataLoader` — supporting multi-worker execution, deterministic shuffling, and distributed data parallel (DDP) sharding.
 
+### 1. Basic DataLoader with Shuffling
 ```python
 from torch.utils.data import DataLoader
 import parquet_dataset_loader as pdl
@@ -462,57 +463,85 @@ for batch in dataloader:
     pass
 ```
 
----
-
-## API Reference
-
-### `load_dataset(...)`
+### 2. Multi-Worker DataLoaders (`num_workers > 0`)
+`IndexedParquetDataset` and its internal components (`RowGroupMemoryCache`, `DiskCache`, `RowGroupReader`, `ProgressiveDiskSaver`) include native `__getstate__` and `__setstate__` pickle serialization guards. This allows worker processes to spawn cleanly without `TypeError: cannot pickle '_thread.lock' object` errors:
 
 ```python
-def load_dataset(
-    path: Union[str, Sequence[str], Mapping[str, Union[str, Sequence[str]]]],
-    name: Optional[str] = None,
-    data_dir: Optional[str] = None,
-    data_files: Optional[Union[str, Sequence[str], Mapping[str, Union[str, Sequence[str]]]]] = None,
-    split: Optional[str] = None,
-    cache_dir: Optional[str] = None,
-    streaming: bool = False,
-    save_to_disk: Union[bool, str] = False,
-    background_download: bool = False,
-    columns: Optional[Sequence[str]] = None,
-    token: Optional[Union[bool, str]] = None,
-    revision: Optional[str] = None,
-    max_cached_row_groups: int = 2,
-    disk_cache: bool = False,
-    max_workers: int = 16,
-    show_progress: bool = False,
-    shuffle: Optional[bool] = None,
-    seed: Optional[int] = None,
-    buffer_size: Optional[int] = None,
-    start_index: Optional[int] = None,
-    from_index: Optional[int] = None,
-    dataset_id: Optional[str] = None,
-    manage: bool = True,
-    **kwargs,
-) -> Union[IndexedParquetDataset, ParquetDatasetDict]
+import torch
+from torch.utils.data import DataLoader
+import parquet_dataset_loader as pdl
+
+ds = pdl.load_dataset(
+    "KhangTruong/COCO-inpainted",
+    split="train",
+    streaming=True,
+    columns=["image", "mask"],
+)
+
+# Multi-process DataLoader using spawn context
+dataloader = DataLoader(
+    ds,
+    batch_size=16,
+    num_workers=4,
+    multiprocessing_context=torch.multiprocessing.get_context("spawn"),
+    pin_memory=True,
+)
 ```
 
-- **`path`**: Hugging Face repo ID, local path, directory, or direct URL.
-- **`split`**: Split name (e.g. `'train'`, `'validation'`), split slice (`'train[:1000]'`), or `None` for all splits.
-- **`streaming`**: If `True`, enables random-access streaming with zero full-file disk downloads. If `False`, downloads files to disk and opens them locally.
-- **`shuffle`**: If `True` (or if `seed` is passed without `shuffle=False`), enables deterministic shuffling. Supported with both streaming and non-streaming.
-- **`seed`**: Integer seed for 100% reproducible shuffling.
-- **`buffer_size`**: Optional buffer size for streaming buffer-based shuffle.
-- **`start_index` / `from_index`**: Row index to start/resume streaming from (0-indexed). Forward background prefetching automatically prioritizes row groups starting from this index.
-- **`save_to_disk`**: Path string or `True`. Enables progressive saving to disk while streaming immediately without blocking. Defaults to `False` (disabled by default when `streaming=True`). If `True`, saves to `~/.cache/parquet_dataset_loader/saved`.
-- **`background_download`**: If `True`, starts a background worker thread to prefetch and archive remaining row groups to disk.
-- **`dataset_id`**: Optional unique name to register this dataset with `DatasetManager`.
-- **`manage`**: Whether to register instance with `DatasetManager` (default `True`).
-- **`columns`**: Column projection list.
-- **`max_cached_row_groups`**: Number of decoded row group tables to keep in RAM simultaneously (default `2`).
-- **`disk_cache`**: If `True`, caches fetched row groups to SSD in Feather format for sub-millisecond repeated reads.
-- **`max_workers`**: Concurrency level for metadata indexing or file downloads.
-- **`show_progress`**: Whether to display progress bars.
+### 3. Distributed Sharding (`ds.shard(...)` and `ds.n_shards`)
+Easily shard across PyTorch DistributedDataParallel (DDP) ranks or across manual worker slices:
+
+```python
+# Shard across 4 GPUs for rank 0:
+# Interleaved stride (default, contiguous=False): rows 0, 4, 8, 12...
+rank_shard = ds.shard(num_shards=4, index=0, contiguous=False)
+
+# Contiguous chunk (contiguous=True): first 25% of rows
+chunk_shard = ds.shard(num_shards=4, index=0, contiguous=True)
+
+# Query number of underlying Parquet files / shards:
+print(f"Number of parquet shards: {ds.n_shards}")
+```
+
+### 4. Arbitrary Index Selection (`ds.select(...)`)
+Filter or subset datasets to specific index lists:
+
+```python
+# Select explicit rows
+sub_ds = ds.select([0, 100, 500, 1000])
+assert len(sub_ds) == 4
+```
+
+---
+
+## API Reference & Default Parameter Values
+
+### `load_dataset(...)` Default Parameters Reference
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `path` | `str` / `Sequence[str]` | *Required* | Hugging Face repository ID, local path, directory, or direct URL. |
+| `name` | `str` / `None` | `None` | Dataset configuration name. |
+| `data_dir` | `str` / `None` | `None` | Subdirectory inside the repository containing parquet files. |
+| `data_files` | `str` / `Sequence[str]` / `None` | `None` | File glob or explicit list of parquet files override. |
+| `split` | `str` / `None` | `None` | Target split (`"train"`, `"validation"`, sliced `"train[:1000]"`), or `None` for all splits. |
+| `cache_dir` | `str` / `None` | `None` | Cache directory for metadata index footers (defaults to `~/.cache/parquet_dataset_loader`). |
+| `streaming` | `bool` | `False` | When `True`, enables instant random-access index streaming without downloading full files. When `False`, downloads files locally. |
+| `save_to_disk` | `bool` / `str` | `False` | When `True` or a path string, progressively persists streamed row groups to disk with zero initial wait. Defaults to `False` (disabled by default on `streaming=True`). If `True`, saves to `~/.cache/parquet_dataset_loader/saved`. |
+| `background_download` | `bool` | `False` | If `True` alongside `save_to_disk`, downloads remaining row groups in a background worker thread while foreground iteration runs unblocked. |
+| `columns` | `Sequence[str]` / `None` | `None` | Column projection list. Only these columns are fetched over the network, dramatically saving bandwidth and RAM. |
+| `token` | `str` / `bool` / `None` | `None` | Hugging Face auth token, or `True` to use stored credentials for private/gated datasets. |
+| `revision` | `str` / `None` | `None` | Specific git branch, revision, or tag (default `"main"`). |
+| `max_cached_row_groups` | `int` | `2` | Number of decoded row groups kept in the thread-safe LRU memory cache (keeps RAM strictly bounded at ~100–200 MB). |
+| `disk_cache` | `bool` | `False` | If `True`, caches downloaded row groups to disk in Feather format for sub-millisecond local reads. |
+| `max_workers` | `int` | `16` | Maximum concurrency level for metadata index footer range requests or downloads. |
+| `show_progress` | `bool` | `False` | Whether to display progress bars during downloads or metadata indexing. |
+| `shuffle` | `bool` / `None` | `None` | If `True` (or if `seed` is provided without `shuffle=False`), enables deterministic index permutation shuffling. |
+| `seed` | `int` / `None` | `None` | Random seed for deterministic pseudo-random shuffling. |
+| `buffer_size` | `int` / `None` | `None` | Optional buffer size for streaming buffer-based rolling shuffle. |
+| `start_index` / `from_index`| `int` / `None` | `None` | Starting row index for streaming. Background prefetch automatically prioritizes row groups starting from this index. |
+| `dataset_id` | `str` / `None` | `None` | Optional unique identifier to register dataset instance with `DatasetManager`. |
+| `manage` | `bool` | `True` | Whether to register instance with `DatasetManager` for global tracking and coordinated shutdown. |
 
 ### `load_from_disk(...)`
 
