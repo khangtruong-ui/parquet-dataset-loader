@@ -248,12 +248,19 @@ shuffled_dict = ds_dict.shuffle(seed=42)
 ### 8. Disk Loading & Saving
 
 ```python
-# Save dataset to disk in Arrow IPC (Feather) format
+# Save dataset to disk in native Parquet and Feather format
 ds.take(500).save_to_disk("./my_local_data")
 
-# Reload from disk
+# Or save without arguments to the default cache directory (~/.cache/parquet_dataset_loader/saved)
+saved_dir = ds_dict.save_to_disk()
+
+# Reload from disk (or call load_from_disk() without arguments to reload from default cache)
 reloaded = pdl.load_from_disk("./my_local_data")
 print(len(reloaded))  # 500
+
+# Multi-split DatasetDict reloading with full Hugging Face compatibility
+reloaded_dict = pdl.load_from_disk(saved_dir)
+print(reloaded_dict.num_rows)  # {'train': 100, 'validation': 30}
 ```
 
 ### 9. Streaming + Save to Disk Simultaneously (Zero Initial Wait)
@@ -470,7 +477,7 @@ def load_dataset(
     split: Optional[str] = None,
     cache_dir: Optional[str] = None,
     streaming: bool = False,
-    save_to_disk: Optional[Union[bool, str]] = None,
+    save_to_disk: Union[bool, str] = False,
     background_download: bool = False,
     columns: Optional[Sequence[str]] = None,
     token: Optional[Union[bool, str]] = None,
@@ -497,7 +504,7 @@ def load_dataset(
 - **`seed`**: Integer seed for 100% reproducible shuffling.
 - **`buffer_size`**: Optional buffer size for streaming buffer-based shuffle.
 - **`start_index` / `from_index`**: Row index to start/resume streaming from (0-indexed). Forward background prefetching automatically prioritizes row groups starting from this index.
-- **`save_to_disk`**: Path string or `True`. Enables progressive saving to disk while streaming immediately without blocking.
+- **`save_to_disk`**: Path string or `True`. Enables progressive saving to disk while streaming immediately without blocking. Defaults to `False` (disabled by default when `streaming=True`). If `True`, saves to `~/.cache/parquet_dataset_loader/saved`.
 - **`background_download`**: If `True`, starts a background worker thread to prefetch and archive remaining row groups to disk.
 - **`dataset_id`**: Optional unique name to register this dataset with `DatasetManager`.
 - **`manage`**: Whether to register instance with `DatasetManager` (default `True`).
@@ -511,7 +518,8 @@ def load_dataset(
 
 ```python
 def load_from_disk(
-    dataset_path: str,
+    dataset_path: Optional[str] = None,
+    split: Optional[str] = None,
     columns: Optional[Sequence[str]] = None,
     shuffle: Optional[bool] = None,
     seed: Optional[int] = None,

@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-10-07
+
+### Added
+- **Default Cache and Save Directory (`DEFAULT_SAVE_DIR`)**:
+  - Sets default save directory to `~/.cache/parquet_dataset_loader/saved` (customizable via `PARQUET_DATASET_LOADER_SAVE_DIR` and `PARQUET_DATASET_LOADER_CACHE`), matching `huggingface_hub`'s hidden cache convention.
+  - Calling `ds.save_to_disk()` or `ds_dict.save_to_disk()` without arguments automatically persists to the default save path and returns the destination path.
+  - Calling `load_from_disk()` without arguments reloads the dataset from the default save directory.
+- **Robust Multi-Split DatasetDict Saving & Reloading**:
+  - `save_to_disk` on `ParquetDatasetDict` now generates standard Hugging Face `dataset_dict.json` manifests and persists both native Parquet and Feather formats per split.
+  - `load_from_disk` reliably detects and reconstructs multi-split `ParquetDatasetDict` from `dataset_dict.json` or split directories, supporting arbitrary custom split names without inaccurate guessing.
+  - Added support for loading single splits from multi-split disk saves via `split="..."`.
+  - Added support for loading Hugging Face Arrow IPC files (`.arrow`) in `load_from_disk`.
+  - Added `num_rows`, `column_names`, `save_progress`, `is_fully_saved`, `stream_and_save()`, and background prefetch controls to `ParquetDatasetDict`.
+  - Added support for progressive multi-split datasets with seamless reloading and resumption.
+
+### Changed
+- **Default Behavior for `save_to_disk`**:
+  - Changed default of `save_to_disk` in `load_dataset` to `False`. When `streaming=True`, disk persistence is disabled by default unless explicitly requested (`save_to_disk=True` or `save_to_disk="path"`).
+  - Explicitly passing `save_to_disk=False` cleanly disables disk saving without launching disk workers.
+
 ## [0.3.0] - 2026-10-07
 
 ### Added

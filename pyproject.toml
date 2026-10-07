@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parquet-dataset-loader"
-version = "0.3.0"
+version = "0.3.1"
 description = "High-performance, memory-efficient loader for large Hugging Face Parquet datasets with instant index-based streaming"
 readme = "README.md"
 authors = [

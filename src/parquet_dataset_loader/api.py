@@ -50,7 +50,14 @@ from parquet_dataset_loader.reader import RowGroupReader, download_parquet_files
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CACHE_DIR = os.path.expanduser("~/.cache/parquet_dataset_loader")
+DEFAULT_CACHE_DIR = os.environ.get(
+    "PARQUET_DATASET_LOADER_CACHE",
+    os.path.expanduser("~/.cache/parquet_dataset_loader"),
+)
+DEFAULT_SAVE_DIR = os.environ.get(
+    "PARQUET_DATASET_LOADER_SAVE_DIR",
+    os.path.join(DEFAULT_CACHE_DIR, "saved"),
+)
 
 
 def load_dataset(
@@ -61,7 +68,7 @@ def load_dataset(
     split: Optional[str] = None,
     cache_dir: Optional[str] = None,
     streaming: bool = False,
-    save_to_disk: Optional[Union[bool, str]] = None,
+    save_to_disk: Union[bool, str] = False,
     background_download: bool = False,
     columns: Optional[Sequence[str]] = None,
     token: Optional[Union[bool, str]] = None,
@@ -99,6 +106,8 @@ def load_dataset(
             parquet files to disk. If False, downloads files to disk and opens them locally.
         save_to_disk: If provided (path string or True), streams immediately with zero
             initial wait while progressively saving fetched row groups to disk simultaneously.
+            Defaults to False (disabled when streaming=True). If True, saves to the default
+            cache directory (~/.cache/parquet_dataset_loader/saved).
         background_download: If True and save_to_disk is enabled, downloads remaining
             row groups in a background worker thread while foreground streams unblocked.
         columns: Optional column projection list. Only these columns will be transferred
@@ -152,9 +161,10 @@ def load_dataset(
 
     target_splits = [base_split] if base_split else list(splits_map.keys())
 
-    # If save_to_disk is requested, automatically switch to streaming=True
-    # so we never block upfront downloading full files!
-    if save_to_disk is not None:
+    # Determine whether progressive disk persistence is requested.
+    # Default is False when streaming=True.
+    should_save_to_disk = bool(save_to_disk)
+    if should_save_to_disk:
         streaming = True
 
     # Mode 1: Non-streaming (download full parquet files to disk if remote)
@@ -209,14 +219,23 @@ def load_dataset(
 
         # Setup progressive save-to-disk if requested
         prog_saver: Optional[ProgressiveDiskSaver] = None
-        if save_to_disk is not None:
+        if should_save_to_disk:
             if isinstance(save_to_disk, str):
                 base_save_dir = os.path.abspath(os.path.expanduser(save_to_disk))
             else:
                 safe_repo_name = (
                     str(path).replace("/", "_").replace(":", "_") if isinstance(path, str) else "dataset"
                 )
-                base_save_dir = os.path.join(resolved_cache_dir, "saved", safe_repo_name)
+                base_save_dir = os.path.join(DEFAULT_SAVE_DIR, safe_repo_name)
+
+            if base_split is None:
+                os.makedirs(base_save_dir, exist_ok=True)
+                dict_meta_file = os.path.join(base_save_dir, "dataset_dict.json")
+                try:
+                    with open(dict_meta_file, "w", encoding="utf-8") as f:
+                        json.dump({"splits": target_splits}, f, indent=2)
+                except Exception:
+                    pass
 
             split_save_dir = (
                 os.path.join(base_save_dir, s) if base_split is None else base_save_dir
@@ -295,7 +314,8 @@ def load_dataset(
 
 
 def load_from_disk(
-    dataset_path: str,
+    dataset_path: Optional[str] = None,
+    split: Optional[str] = None,
     columns: Optional[Sequence[str]] = None,
     shuffle: Optional[bool] = None,
     seed: Optional[int] = None,
@@ -314,9 +334,12 @@ def load_from_disk(
 
     Supports resuming incomplete downloads and progressive saves, either by
     reconnecting to the original source or loading the available local rows.
+    Handles both ParquetDatasetDict (multi-split) and IndexedParquetDataset (single split).
 
     Args:
-        dataset_path: Path to the directory containing saved dataset files.
+        dataset_path: Path to the directory containing saved dataset files, or None
+            to load from the default save directory (~/.cache/parquet_dataset_loader/saved).
+        split: Optional split name to load if dataset_path contains multiple splits.
         columns: Optional column projection list.
         shuffle: Optional shuffle flag.
         seed: Optional integer seed for reproducible shuffling.
@@ -335,21 +358,139 @@ def load_from_disk(
     Returns:
         IndexedParquetDataset or ParquetDatasetDict.
     """
-    abs_path = os.path.abspath(os.path.expanduser(dataset_path))
+    if dataset_path is None:
+        if not os.path.exists(DEFAULT_SAVE_DIR):
+            raise DatasetNotFoundError(
+                DEFAULT_SAVE_DIR,
+                "No default save directory found. Please specify dataset_path explicitly.",
+            )
+        candidates = [
+            os.path.join(DEFAULT_SAVE_DIR, d)
+            for d in os.listdir(DEFAULT_SAVE_DIR)
+            if os.path.isdir(os.path.join(DEFAULT_SAVE_DIR, d)) and not d.startswith(".")
+        ]
+        if not candidates:
+            raise DatasetNotFoundError(
+                DEFAULT_SAVE_DIR,
+                "No saved datasets found in default save directory.",
+            )
+        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        abs_path = os.path.abspath(candidates[0])
+    else:
+        abs_path = os.path.abspath(os.path.expanduser(dataset_path))
+
     if not os.path.exists(abs_path):
-        raise DatasetNotFoundError(dataset_path, "Local path does not exist.")
+        raise DatasetNotFoundError(dataset_path or abs_path, "Local path does not exist.")
 
-    # Check if single split or multiple splits
     entries = os.listdir(abs_path)
-    subdirs = [e for e in entries if os.path.isdir(os.path.join(abs_path, e))]
 
-    if subdirs and any(os.path.exists(os.path.join(abs_path, d, f"{d}.feather")) for d in subdirs):
-        # Multiple splits
-        splits_dict: Dict[str, IndexedParquetDataset] = {}
-        for d in sorted(subdirs):
+    # 1. Check if dataset_dict.json exists in abs_path (standard DatasetDict format)
+    dict_manifest_file = os.path.join(abs_path, "dataset_dict.json")
+    if os.path.exists(dict_manifest_file):
+        try:
+            with open(dict_manifest_file, "r", encoding="utf-8") as f:
+                dmeta = json.load(f)
+            splits_list = dmeta.get("splits", [])
+        except Exception:
+            splits_list = []
+
+        if splits_list:
+            if split is not None:
+                if split in splits_list:
+                    return load_from_disk(
+                        os.path.join(abs_path, split),
+                        split=split,
+                        columns=columns,
+                        shuffle=shuffle,
+                        seed=seed,
+                        buffer_size=buffer_size,
+                        start_index=start_index,
+                        from_index=from_index,
+                        resume=resume,
+                        allow_incomplete=allow_incomplete,
+                        background_download=background_download,
+                        token=token,
+                        dataset_id=dataset_id,
+                        manage=manage,
+                        **kwargs,
+                    )
+                raise SplitNotFoundError(split, splits_list)
+
+            splits_dict: Dict[str, IndexedParquetDataset] = {}
+            for s in splits_list:
+                s_dir = os.path.join(abs_path, s)
+                splits_dict[s] = load_from_disk(
+                    s_dir,
+                    split=s,
+                    columns=columns,
+                    shuffle=shuffle,
+                    seed=seed,
+                    buffer_size=buffer_size,
+                    start_index=start_index,
+                    from_index=from_index,
+                    resume=resume,
+                    allow_incomplete=allow_incomplete,
+                    background_download=background_download,
+                    token=token,
+                    manage=False,
+                    **kwargs,
+                )  # type: ignore
+            dict_res = ParquetDatasetDict(splits_dict, dataset_id=dataset_id)
+            if manage:
+                get_dataset_manager().register(dict_res, dataset_id=dataset_id)
+            return dict_res
+
+    # 2. Check for multi-split subdirectories if no dataset_dict.json
+    subdirs = [
+        e
+        for e in sorted(entries)
+        if os.path.isdir(os.path.join(abs_path, e)) and not e.startswith((".", "__"))
+    ]
+
+    def _is_split_dir(d_path: str) -> bool:
+        if not os.path.isdir(d_path):
+            return False
+        d_entries = os.listdir(d_path)
+        return (
+            os.path.exists(os.path.join(d_path, "row_groups"))
+            or any(f.endswith((".parquet", ".pq", ".feather", ".arrow")) for f in d_entries)
+            or any(f.endswith(("_manifest.json", "_info.json", "state.json")) for f in d_entries)
+        )
+
+    split_subdirs = [d for d in subdirs if _is_split_dir(os.path.join(abs_path, d))]
+    has_root_data = (
+        os.path.exists(os.path.join(abs_path, "row_groups"))
+        or any(f.endswith((".parquet", ".pq", ".feather", ".arrow")) for f in entries)
+    )
+
+    if split_subdirs and not has_root_data:
+        if split is not None:
+            if split in split_subdirs:
+                return load_from_disk(
+                    os.path.join(abs_path, split),
+                    split=split,
+                    columns=columns,
+                    shuffle=shuffle,
+                    seed=seed,
+                    buffer_size=buffer_size,
+                    start_index=start_index,
+                    from_index=from_index,
+                    resume=resume,
+                    allow_incomplete=allow_incomplete,
+                    background_download=background_download,
+                    token=token,
+                    dataset_id=dataset_id,
+                    manage=manage,
+                    **kwargs,
+                )
+            raise SplitNotFoundError(split, split_subdirs)
+
+        splits_dict = {}
+        for d in split_subdirs:
             split_dir = os.path.join(abs_path, d)
             splits_dict[d] = load_from_disk(
                 split_dir,
+                split=d,
                 columns=columns,
                 shuffle=shuffle,
                 seed=seed,
@@ -363,16 +504,36 @@ def load_from_disk(
                 manage=False,
                 **kwargs,
             )  # type: ignore
-        dict_res = ParquetDatasetDict(splits_dict)
+        dict_res = ParquetDatasetDict(splits_dict, dataset_id=dataset_id)
         if manage:
             get_dataset_manager().register(dict_res, dataset_id=dataset_id)
         return dict_res
 
-    # Check if this is a progressive save directory with row_groups/
+    # 3. Single split loading
+    eff_split = split
+    if not eff_split:
+        manifest_files = [f for f in entries if f.endswith("_manifest.json")]
+        if manifest_files:
+            eff_split = manifest_files[0].replace("_manifest.json", "")
+    if not eff_split:
+        info_files = [f for f in entries if f.endswith("_info.json") and not f.startswith("dataset_")]
+        if info_files:
+            try:
+                with open(os.path.join(abs_path, info_files[0]), "r", encoding="utf-8") as f:
+                    imeta = json.load(f)
+                eff_split = imeta.get("split")
+            except Exception:
+                pass
+    if not eff_split:
+        base_name = os.path.basename(abs_path)
+        if base_name and base_name not in ("saved", "downloads", "data"):
+            eff_split = base_name
+
+    # Check progressive save directory with row_groups/
     rg_dir = os.path.join(abs_path, "row_groups")
     if os.path.exists(rg_dir):
         manifest_files = [f for f in entries if f.endswith("_manifest.json")]
-        split_name = (
+        split_name = eff_split or (
             manifest_files[0].replace("_manifest.json", "")
             if manifest_files
             else "train"
@@ -388,7 +549,6 @@ def load_from_disk(
             except Exception:
                 pass
 
-        # If incomplete and resume requested with known source, resume from remote!
         if not is_complete and resume and source_path:
             logger.info("Resuming incomplete dataset from source '%s' to '%s'", source_path, abs_path)
             return load_dataset(
@@ -411,7 +571,7 @@ def load_from_disk(
 
         if not is_complete and not allow_incomplete:
             raise ParquetDatasetError(
-                f"Incomplete progressive dataset at '{dataset_path}' has not finished saving. "
+                f"Incomplete progressive dataset at '{dataset_path or abs_path}' has not finished saving. "
                 "Set resume=True to finish downloading from source, or allow_incomplete=True to load partial rows."
             )
 
@@ -452,38 +612,94 @@ def load_from_disk(
                 **kwargs,
             )
 
-    # Single split
-    # Look for .feather or .parquet files
-    data_files = [f for f in entries if f.endswith((".feather", ".parquet", ".pq"))]
-    if not data_files:
-        raise DatasetNotFoundError(dataset_path, "No data files found in saved directory.")
+    # Check for direct parquet files
+    parquet_files = [f for f in entries if f.endswith((".parquet", ".pq"))]
+    split_name = eff_split or (
+        infer_split_name(parquet_files[0]) if parquet_files else "train"
+    )
 
-    first_file = os.path.join(abs_path, data_files[0])
-    split_name = infer_split_name(first_file)
+    if parquet_files:
+        if f"{split_name}.parquet" in parquet_files:
+            target_path = os.path.join(abs_path, f"{split_name}.parquet")
+        elif len(parquet_files) == 1:
+            target_path = os.path.join(abs_path, parquet_files[0])
+        else:
+            target_path = [os.path.join(abs_path, f) for f in sorted(parquet_files)]
 
-    if first_file.endswith(".feather"):
-        # Load via feather
-        table = feather.read_table(first_file, columns=list(columns) if columns else None, memory_map=True)
-        # Create a local in-memory/feather IndexedParquetDataset or return HF dataset
-        # To maintain exact interface, write out a fast parquet or construct index:
+        return load_dataset(
+            path=target_path,
+            split=split_name,
+            streaming=False,
+            columns=columns,
+            shuffle=shuffle,
+            seed=seed,
+            buffer_size=buffer_size,
+            start_index=start_index,
+            from_index=from_index,
+            dataset_id=dataset_id,
+            manage=manage,
+            **kwargs,
+        )
+
+    # Check for feather files
+    feather_files = [f for f in entries if f.endswith(".feather")]
+    if feather_files:
+        target_feather = (
+            os.path.join(abs_path, f"{split_name}.feather")
+            if f"{split_name}.feather" in feather_files
+            else os.path.join(abs_path, feather_files[0])
+        )
+        table = feather.read_table(
+            target_feather, columns=list(columns) if columns else None, memory_map=True
+        )
         tmp_parquet = os.path.join(abs_path, f"{split_name}.parquet")
         if not os.path.exists(tmp_parquet):
             pq.write_table(table, tmp_parquet, compression="snappy")
-        first_file = tmp_parquet
+        return load_dataset(
+            path=tmp_parquet,
+            split=split_name,
+            streaming=False,
+            columns=columns,
+            shuffle=shuffle,
+            seed=seed,
+            buffer_size=buffer_size,
+            start_index=start_index,
+            from_index=from_index,
+            dataset_id=dataset_id,
+            manage=manage,
+            **kwargs,
+        )
 
-    return load_dataset(
-        path=first_file,
-        split=split_name,
-        streaming=False,
-        columns=columns,
-        shuffle=shuffle,
-        seed=seed,
-        buffer_size=buffer_size,
-        start_index=start_index,
-        from_index=from_index,
-        dataset_id=dataset_id,
-        manage=manage,
-        **kwargs,
+    # Check for Arrow IPC files (.arrow)
+    arrow_files = [f for f in entries if f.endswith(".arrow")]
+    if arrow_files:
+        target_arrow = os.path.join(abs_path, arrow_files[0])
+        try:
+            with pa.ipc.open_file(target_arrow) as reader:
+                table = reader.read_all()
+        except Exception:
+            with pa.ipc.open_stream(target_arrow) as reader:
+                table = reader.read_all()
+        tmp_parquet = os.path.join(abs_path, f"{split_name}.parquet")
+        if not os.path.exists(tmp_parquet):
+            pq.write_table(table, tmp_parquet, compression="snappy")
+        return load_dataset(
+            path=tmp_parquet,
+            split=split_name,
+            streaming=False,
+            columns=columns,
+            shuffle=shuffle,
+            seed=seed,
+            buffer_size=buffer_size,
+            start_index=start_index,
+            from_index=from_index,
+            dataset_id=dataset_id,
+            manage=manage,
+            **kwargs,
+        )
+
+    raise DatasetNotFoundError(
+        dataset_path or abs_path, "No data files found in saved directory."
     )
 
 
@@ -522,6 +738,51 @@ def resume_dataset(
         raise DatasetNotFoundError(dataset_path, "Directory does not exist.")
 
     entries = os.listdir(abs_path)
+
+    # Check for multi-split dataset_dict.json
+    dict_json = os.path.join(abs_path, "dataset_dict.json")
+    if os.path.exists(dict_json):
+        try:
+            with open(dict_json, "r", encoding="utf-8") as f:
+                dmeta = json.load(f)
+            splits_list = dmeta.get("splits", [])
+        except Exception:
+            splits_list = []
+
+        if splits_list:
+            if split is not None:
+                if split in splits_list:
+                    return resume_dataset(
+                        os.path.join(abs_path, split),
+                        source_path=source_path,
+                        split=split,
+                        background_download=background_download,
+                        columns=columns,
+                        token=token,
+                        dataset_id=dataset_id,
+                        manage=manage,
+                        **kwargs,
+                    )
+                raise SplitNotFoundError(split, splits_list)
+
+            splits_dict: Dict[str, IndexedParquetDataset] = {}
+            for s in splits_list:
+                splits_dict[s] = resume_dataset(
+                    os.path.join(abs_path, s),
+                    source_path=source_path,
+                    split=s,
+                    background_download=background_download,
+                    columns=columns,
+                    token=token,
+                    manage=False,
+                    **kwargs,
+                )  # type: ignore
+            dict_res = ParquetDatasetDict(splits_dict, dataset_id=dataset_id)
+            if manage:
+                get_dataset_manager().register(dict_res, dataset_id=dataset_id)
+            return dict_res
+
+    # Single split
     manifest_files = [f for f in entries if f.endswith("_manifest.json")]
     detected_split = split
     detected_source = source_path

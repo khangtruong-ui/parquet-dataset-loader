@@ -4,7 +4,13 @@ A high-performance, memory-efficient loader for large Hugging Face Parquet datas
 featuring instant random-access index streaming without downloading multi-gigabyte files.
 """
 
-from parquet_dataset_loader.api import load_dataset, load_from_disk, resume_dataset
+from parquet_dataset_loader.api import (
+    DEFAULT_CACHE_DIR,
+    DEFAULT_SAVE_DIR,
+    load_dataset,
+    load_from_disk,
+    resume_dataset,
+)
 from parquet_dataset_loader.cache import DiskCache, RowGroupMemoryCache
 from parquet_dataset_loader.dataset import IndexedParquetDataset, ParquetDatasetDict
 from parquet_dataset_loader.exceptions import (
@@ -38,9 +44,11 @@ from parquet_dataset_loader.manager import (
 from parquet_dataset_loader.progressive import BackgroundDownloader, ProgressiveDiskSaver
 from parquet_dataset_loader.reader import RowGroupReader, download_parquet_files
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 __all__ = [
     "__version__",
+    "DEFAULT_CACHE_DIR",
+    "DEFAULT_SAVE_DIR",
     "load_dataset",
     "load_from_disk",
     "resume_dataset",

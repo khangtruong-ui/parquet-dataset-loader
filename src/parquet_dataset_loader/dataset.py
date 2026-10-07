@@ -687,18 +687,32 @@ class IndexedParquetDataset(collections.abc.Sequence):
         table = self.to_arrow()
         return datasets.Dataset(table)
 
-    def save_to_disk(self, target_dir: str) -> None:
-        """Save this dataset to a local directory in Arrow IPC format.
+    def save_to_disk(self, target_dir: Optional[str] = None) -> str:
+        """Save this dataset to a local directory in Arrow IPC and Parquet format.
 
         Compatible with load_from_disk.
 
         Args:
-            target_dir: Local destination directory.
+            target_dir: Local destination directory, or None to save to default cache (~/.cache/parquet_dataset_loader/saved).
+
+        Returns:
+            The path to the saved directory.
         """
-        os.makedirs(target_dir, exist_ok=True)
+        if target_dir is None:
+            from parquet_dataset_loader.api import DEFAULT_SAVE_DIR
+            ds_name = self.dataset_id or self.split or "dataset"
+            safe_name = str(ds_name).replace("/", "_").replace(":", "_")
+            target_dir = os.path.join(DEFAULT_SAVE_DIR, safe_name)
+
+        abs_target_dir = os.path.abspath(os.path.expanduser(target_dir))
+        os.makedirs(abs_target_dir, exist_ok=True)
         table = self.to_arrow()
-        data_file = os.path.join(target_dir, f"{self.split}.feather")
+        data_file = os.path.join(abs_target_dir, f"{self.split}.feather")
         feather.write_feather(table, data_file, compression="zstd")
+
+        # Also write native Parquet file for fast loading
+        parquet_file = os.path.join(abs_target_dir, f"{self.split}.parquet")
+        pq.write_table(table, parquet_file, compression="snappy")
 
         # Save metadata info
         state = {
@@ -706,11 +720,14 @@ class IndexedParquetDataset(collections.abc.Sequence):
             "num_rows": len(self),
             "columns": self.column_names,
             "data_file": os.path.basename(data_file),
+            "parquet_file": os.path.basename(parquet_file),
             "format": "feather",
         }
         import json
-        with open(os.path.join(target_dir, f"{self.split}_info.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(abs_target_dir, f"{self.split}_info.json"), "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
+
+        return abs_target_dir
 
     def __repr__(self) -> str:
         col_repr = ", ".join(self.column_names[:5])
@@ -791,12 +808,85 @@ class ParquetDatasetDict(dict):
             {split: ds.to_hf_dataset() for split, ds in self.items()}
         )
 
-    def save_to_disk(self, target_dir: str) -> None:
-        """Save all splits to a local directory."""
-        os.makedirs(target_dir, exist_ok=True)
+    @property
+    def num_rows(self) -> Dict[str, int]:
+        """Dictionary of number of rows per split."""
+        return {k: len(v) for k, v in self.items()}
+
+    @property
+    def column_names(self) -> Dict[str, List[str]]:
+        """Dictionary of column names per split."""
+        return {k: list(v.column_names) for k, v in self.items()}
+
+    @property
+    def save_progress(self) -> float:
+        """Average save progress across all splits (0.0 to 1.0)."""
+        if not self:
+            return 1.0
+        return sum(getattr(ds, "save_progress", 0.0) for ds in self.values()) / len(self)
+
+    @property
+    def is_fully_saved(self) -> bool:
+        """Whether all splits are fully saved to disk."""
+        return all(getattr(ds, "is_fully_saved", False) for ds in self.values()) if self else False
+
+    def stream_and_save(self, show_progress: bool = True) -> ParquetDatasetDict:
+        """Stream through all splits saving all row groups to disk."""
+        for ds in self.values():
+            if hasattr(ds, "stream_and_save"):
+                ds.stream_and_save(show_progress=show_progress)
+        return self
+
+    def start_background_download(self, **kwargs: Any) -> None:
+        """Start background prefetching across all splits."""
+        for ds in self.values():
+            if hasattr(ds, "start_background_download"):
+                ds.start_background_download(**kwargs)
+
+    def stop_background_download(self) -> None:
+        """Stop background downloaders across all splits."""
+        for ds in self.values():
+            if hasattr(ds, "stop_background_download"):
+                ds.stop_background_download()
+
+    def save_to_disk(self, target_dir: Optional[str] = None) -> str:
+        """Save all splits to a local directory with dataset_dict.json manifest.
+
+        Args:
+            target_dir: Local destination directory, or None to save to default cache (~/.cache/parquet_dataset_loader/saved).
+
+        Returns:
+            The path to the saved directory.
+        """
+        if target_dir is None:
+            from parquet_dataset_loader.api import DEFAULT_SAVE_DIR
+            ds_name = (
+                getattr(self, "dataset_id", None)
+                or getattr(self, "_dataset_id", None)
+                or "dataset_dict"
+            )
+            safe_name = str(ds_name).replace("/", "_").replace(":", "_")
+            target_dir = os.path.join(DEFAULT_SAVE_DIR, safe_name)
+
+        abs_target_dir = os.path.abspath(os.path.expanduser(target_dir))
+        os.makedirs(abs_target_dir, exist_ok=True)
+
+        # Write dataset_dict.json manifest matching Hugging Face DatasetDict
+        import json
+        manifest = {
+            "splits": list(self.keys()),
+        }
+        with open(os.path.join(abs_target_dir, "dataset_dict.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+
         for split, ds in self.items():
-            split_dir = os.path.join(target_dir, split)
+            split_dir = os.path.join(abs_target_dir, split)
+            orig_split = getattr(ds, "split", None)
+            if orig_split != split and hasattr(ds, "split"):
+                ds.split = split
             ds.save_to_disk(split_dir)
+
+        return abs_target_dir
 
     def __enter__(self) -> ParquetDatasetDict:
         return self

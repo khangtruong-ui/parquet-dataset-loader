@@ -6,6 +6,7 @@ split names to concrete file paths or download/stream URLs.
 """
 
 import glob
+import json
 import os
 import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
@@ -154,7 +155,8 @@ def infer_split_name(filename_or_path: str) -> str:
     1. If filename contains 'train' (case-insensitive) -> 'train'
     2. If filename contains 'val', 'valid', 'validation', 'dev', 'eval' -> 'validation'
     3. If filename contains 'test' -> 'test'
-    4. Otherwise -> 'train' (default standard split)
+    4. If parent folder contains split tokens -> split name
+    5. Otherwise -> 'train' (default standard split)
 
     Args:
         filename_or_path: The file path, URL, or filename to inspect.
@@ -173,6 +175,17 @@ def infer_split_name(filename_or_path: str) -> str:
     if any(t in tokens for t in ["train", "training"]):
         return "train"
 
+    # Check parent directory tokens if present
+    dirname = os.path.dirname(filename_or_path)
+    if dirname:
+        dir_tokens = re.split(r"[^a-z0-9]", os.path.basename(dirname).lower())
+        if any(t in dir_tokens for t in ["val", "valid", "validation", "dev", "eval"]):
+            return "validation"
+        if any(t in dir_tokens for t in ["test", "testing"]):
+            return "test"
+        if any(t in dir_tokens for t in ["train", "training"]):
+            return "train"
+
     # Substring checks if token match didn't catch it
     if "val" in basename or "dev" in basename:
         return "validation"
@@ -186,11 +199,13 @@ def infer_split_name(filename_or_path: str) -> str:
 
 def resolve_local_files(
     path: str,
+    split: Optional[str] = None,
 ) -> Dict[str, List[str]]:
     """Resolve a local file or directory into split mappings.
 
     Args:
         path: Path to a local Parquet file or a directory containing Parquet files.
+        split: Optional explicit split name override when resolving a single file or directory.
 
     Returns:
         Mapping of split name to sorted list of absolute file paths.
@@ -207,8 +222,31 @@ def resolve_local_files(
             raise DatasetNotFoundError(
                 path, "Local file exists but is not a Parquet file (.parquet or .pq)."
             )
-        split = infer_split_name(abs_path)
-        return {split: [abs_path]}
+        split_name = split if split is not None else infer_split_name(abs_path)
+        return {split_name: [abs_path]}
+
+    # Check for Hugging Face / PDL dataset_dict.json manifest
+    dict_json = os.path.join(abs_path, "dataset_dict.json")
+    if os.path.exists(dict_json):
+        try:
+            with open(dict_json, "r", encoding="utf-8") as f:
+                ddata = json.load(f)
+            splits_list = ddata.get("splits", [])
+            splits_map: Dict[str, List[str]] = {}
+            for s in splits_list:
+                s_dir = os.path.join(abs_path, s)
+                if os.path.isdir(s_dir):
+                    s_files = [
+                        os.path.join(s_dir, f)
+                        for f in os.listdir(s_dir)
+                        if f.endswith((".parquet", ".pq"))
+                    ]
+                    if s_files:
+                        splits_map[s] = sorted(s_files)
+            if splits_map:
+                return splits_map
+        except Exception:
+            pass
 
     # It is a directory
     parquet_files: List[str] = []
@@ -224,8 +262,19 @@ def resolve_local_files(
 
     splits: Dict[str, List[str]] = {}
     for f in sorted(parquet_files):
-        s = infer_split_name(f)
+        rel = os.path.relpath(f, abs_path)
+        parts = rel.split(os.sep)
+        if len(parts) > 1 and not parts[0].startswith((".", "__")):
+            s = parts[0]
+        else:
+            s = infer_split_name(f)
         splits.setdefault(s, []).append(f)
+
+    # If caller requested a specific split that wasn't inferred and there's only 1 split found,
+    # map it to the requested split
+    if split is not None and split not in splits and len(splits) == 1:
+        only_key = list(splits.keys())[0]
+        splits = {split: splits[only_key]}
 
     return splits
 
@@ -375,14 +424,18 @@ def resolve_parquet_dataset(
 
     # Case B: path is a local file or directory that exists
     elif isinstance(path, str) and os.path.exists(os.path.expanduser(path)):
-        splits = resolve_local_files(path)
+        splits = resolve_local_files(path, split=split)
 
     # Case C: path is a list of URLs or files
     elif isinstance(path, (list, tuple)):
-        merged = {}
-        for item in path:
-            merged.setdefault(infer_split_name(item), []).append(str(item))
-        splits = merged
+        if split is not None:
+            base_s, _ = parse_split_slice(split)
+            splits = {base_s or "train": [str(item) for item in path]}
+        else:
+            merged = {}
+            for item in path:
+                merged.setdefault(infer_split_name(item), []).append(str(item))
+            splits = merged
 
     # Case D: path is a Hugging Face repository identifier
     elif isinstance(path, str):
