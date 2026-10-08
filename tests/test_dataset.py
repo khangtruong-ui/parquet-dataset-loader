@@ -220,3 +220,20 @@ def test_dataset_select_and_shard(sample_dataset: IndexedParquetDataset) -> None
     assert i_shard1[1]["id"] == 5
 
 
+def test_dataset_pytorch_multi_worker_dataloader(sample_dataset: IndexedParquetDataset) -> None:
+    """Verify IndexedParquetDataset runs seamlessly with multi-worker PyTorch DataLoader across fork."""
+    try:
+        import torch
+        from torch.utils.data import DataLoader
+    except ImportError:
+        pytest.skip("PyTorch not installed")
+
+    loader = DataLoader(sample_dataset, batch_size=10, num_workers=2, shuffle=False)
+    batches = list(loader)
+    assert len(batches) == 10
+    first_batch = batches[0]
+    assert len(first_batch["id"]) == 10
+    assert first_batch["id"][0].item() == 0
+
+
+

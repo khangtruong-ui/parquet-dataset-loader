@@ -56,13 +56,32 @@ class RowGroupReader:
 
         self._open_files: OrderedDict[str, Tuple[Any, pq.ParquetFile]] = OrderedDict()
         self._lock = threading.Lock()
+        self._http_fs = None
+        self._http_fs_pid = None
+        # Initialize filesystem for current process
+        _ = self.http_fs
 
-        # Configure filesystem
-        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
-        self._http_fs = fsspec.filesystem("http", headers=headers)
+    @property
+    def http_fs(self) -> Any:
+        """Obtain a fork-safe fsspec HTTP filesystem for current process."""
+        current_pid = os.getpid()
+        if (
+            not hasattr(self, "_http_fs_pid")
+            or self._http_fs_pid != current_pid
+            or getattr(self, "_http_fs", None) is None
+        ):
+            headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+            self._http_fs = fsspec.filesystem("http", headers=headers)
+            self._http_fs_pid = current_pid
+            self._lock = threading.Lock()
+            if hasattr(self, "_open_files"):
+                self._open_files.clear()
+        return self._http_fs
 
     def _get_parquet_file(self, file_url_or_path: str) -> pq.ParquetFile:
         """Obtain a reusable ParquetFile instance for the specified file."""
+        # Ensure filesystem is initialized for current process
+        _ = self.http_fs
         with self._lock:
             if file_url_or_path in self._open_files:
                 self._open_files.move_to_end(file_url_or_path)
@@ -81,7 +100,7 @@ class RowGroupReader:
             fp = None
             try:
                 if is_remote:
-                    fp = self._http_fs.open(file_url_or_path, "rb", block_size=self.block_size)
+                    fp = self.http_fs.open(file_url_or_path, "rb", block_size=self.block_size)
                     pf = pq.ParquetFile(fp)
                 else:
                     abs_path = os.path.abspath(os.path.expanduser(file_url_or_path))
@@ -176,14 +195,15 @@ class RowGroupReader:
         state.pop("_lock", None)
         state.pop("_open_files", None)
         state.pop("_http_fs", None)
+        state.pop("_http_fs_pid", None)
         return state
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
         self.__dict__.update(state)
         self._lock = threading.Lock()
         self._open_files = OrderedDict()
-        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
-        self._http_fs = fsspec.filesystem("http", headers=headers)
+        self._http_fs = None
+        self._http_fs_pid = None
 
 
 
