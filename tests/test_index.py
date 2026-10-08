@@ -167,3 +167,19 @@ def test_index_serialization_and_cache(temp_dir: str) -> None:
     rg, local = loaded.locate_row(25)
     assert rg.rg_index == 2
     assert local == 5
+
+
+def test_index_cache_invalidation_on_local_file_change(temp_dir: str) -> None:
+    f1 = os.path.join(temp_dir, "f_mod.parquet")
+    create_sample_parquet_file(f1, num_rows=30, row_group_size=10)
+
+    index1 = build_metadata_index([f1], split_name="train", cache_dir=temp_dir, use_cache=True)
+    assert index1.total_rows == 30
+
+    # Overwrite f1 with 10 rows
+    create_sample_parquet_file(f1, num_rows=10, row_group_size=5)
+
+    # Building index should detect mtime/size change and not return stale 30-row index
+    index2 = build_metadata_index([f1], split_name="train", cache_dir=temp_dir, use_cache=True)
+    assert index2.total_rows == 10
+

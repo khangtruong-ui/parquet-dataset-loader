@@ -434,12 +434,29 @@ def build_metadata_index(
         hasher.update(split_name.encode("utf-8"))
         for f in files:
             hasher.update(f.encode("utf-8"))
+            if not f.startswith(("http://", "https://")) and os.path.exists(f):
+                try:
+                    stat = os.stat(f)
+                    hasher.update(str(stat.st_mtime_ns).encode("utf-8"))
+                    hasher.update(str(stat.st_size).encode("utf-8"))
+                except OSError:
+                    pass
         cache_key = hasher.hexdigest()[:24]
         cache_file = os.path.join(cache_dir, "indices", f"{split_name}_{cache_key}.json")
 
         cached_index = MetadataIndex.load_cache(cache_file)
         if cached_index is not None and cached_index.total_rows > 0:
-            return cached_index
+            is_valid = True
+            for file_info in cached_index.files:
+                if not file_info.url_or_path.startswith(("http://", "https://")):
+                    if not os.path.exists(file_info.url_or_path):
+                        is_valid = False
+                        break
+                    if os.path.getsize(file_info.url_or_path) != file_info.file_size:
+                        is_valid = False
+                        break
+            if is_valid:
+                return cached_index
 
     session = create_retry_session()
     raw_results: List[Optional[Tuple[int, pq.FileMetaData]]] = [None] * len(files)
