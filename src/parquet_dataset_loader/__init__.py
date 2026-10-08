@@ -11,8 +11,11 @@ from parquet_dataset_loader.api import (
     load_from_disk,
     resume_dataset,
 )
-from parquet_dataset_loader.cache import DiskCache, RowGroupMemoryCache
-from parquet_dataset_loader.dataset import IndexedParquetDataset, ParquetDatasetDict
+from parquet_dataset_loader.dataset import (
+    BlockShuffledSampler,
+    IndexedParquetDataset,
+    ParquetDatasetDict,
+)
 from parquet_dataset_loader.exceptions import (
     CorruptParquetError,
     DatasetNotFoundError,
@@ -52,6 +55,7 @@ __all__ = [
     "load_dataset",
     "load_from_disk",
     "resume_dataset",
+    "BlockShuffledSampler",
     "IndexedParquetDataset",
     "ParquetDatasetDict",
     "DatasetManager",

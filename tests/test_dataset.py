@@ -236,4 +236,29 @@ def test_dataset_pytorch_multi_worker_dataloader(sample_dataset: IndexedParquetD
     assert first_batch["id"][0].item() == 0
 
 
+def test_dataset_block_shuffled_sampler(sample_dataset: IndexedParquetDataset) -> None:
+    """Verify BlockShuffledSampler preserves sample count and permutes row groups across epochs."""
+    from parquet_dataset_loader.dataset import BlockShuffledSampler
+
+    groups = sample_dataset.get_row_group_indices()
+    assert len(groups) > 0
+    total_samples = sum(len(g) for g in groups)
+    assert total_samples == len(sample_dataset)
+
+    sampler = BlockShuffledSampler(sample_dataset, window_blocks=2, seed=42, shuffle=True)
+    assert len(sampler) == len(sample_dataset)
+
+    indices_ep0 = list(sampler)
+    assert len(indices_ep0) == len(sample_dataset)
+    assert set(indices_ep0) == set(range(len(sample_dataset)))
+
+    sampler.set_epoch(1)
+    indices_ep1 = list(sampler)
+    assert len(indices_ep1) == len(sample_dataset)
+    assert set(indices_ep1) == set(range(len(sample_dataset)))
+    # Different epochs produce different permutations
+    assert indices_ep0 != indices_ep1
+
+
+
 

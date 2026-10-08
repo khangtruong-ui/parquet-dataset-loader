@@ -530,6 +530,39 @@ class IndexedParquetDataset(collections.abc.Sequence):
         indices = range(index, self._length, num_shards)
         return self.select(indices)
 
+    def get_row_group_indices(self) -> List[List[int]]:
+        """Return dataset row indices grouped by underlying Parquet row group.
+
+        Useful for locality-preserving batch sampling and avoiding cache thrashing
+        during multi-worker PyTorch DataLoader iterations.
+
+        Returns:
+            A list of lists, where each sublist contains sample indices from a single row group.
+        """
+        if self._length == 0:
+            return []
+
+        if self.indices is None:
+            groups: List[List[int]] = []
+            global_start = self.offset
+            global_stop = self.offset + self._length
+            ranges = self.index.locate_range(global_start, global_stop)
+            curr = 0
+            for _, local_start, local_stop in ranges:
+                n_rows = local_stop - local_start
+                if n_rows > 0:
+                    groups.append(list(range(curr, curr + n_rows)))
+                    curr += n_rows
+            return groups
+
+        from collections import defaultdict
+        rg_map = defaultdict(list)
+        for i, global_idx in enumerate(self.indices):
+            rg_info, _ = self.index.locate_row(global_idx)
+            rg_key = (rg_info.file_index, rg_info.rg_index)
+            rg_map[rg_key].append(i)
+        return list(rg_map.values())
+
     def to_arrow(self, batch_size: int = 1000) -> pa.Table:
         """Materialize this dataset view as an in-memory PyArrow Table.
 
@@ -993,3 +1026,62 @@ class ParquetDatasetDict(dict):
             for k, v in self.items()
         )
         return f"ParquetDatasetDict({{\n{splits_str}\n}})"
+
+
+class BlockShuffledSampler:
+    """PyTorch-compatible Sampler that preserves row-group cache locality.
+
+    Permutes row groups across epochs while shuffling within sliding windows of
+    blocks, preventing multi-worker memory cache thrashing and reducing disk/network I/O
+    by orders of magnitude.
+    """
+
+    def __init__(
+        self,
+        dataset: Any,
+        window_blocks: int = 2,
+        seed: int = 42,
+        shuffle: bool = True,
+    ) -> None:
+        self.dataset = dataset
+        self.window_blocks = max(1, int(window_blocks))
+        self.seed = int(seed)
+        self.shuffle = bool(shuffle)
+        self.epoch = 0
+
+        if hasattr(dataset, "get_row_group_indices"):
+            self.groups = dataset.get_row_group_indices()
+        elif hasattr(dataset, "pdl_dataset") and hasattr(dataset.pdl_dataset, "get_row_group_indices"):
+            self.groups = dataset.pdl_dataset.get_row_group_indices()
+        else:
+            self.groups = [list(range(len(dataset)))]
+
+    def set_epoch(self, epoch: int) -> None:
+        """Set epoch index to vary shuffling permutation deterministically across epochs."""
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[int]:
+        if not self.shuffle:
+            for g in self.groups:
+                yield from g
+            return
+
+        rng = random.Random(self.seed + self.epoch)
+        group_order = list(range(len(self.groups)))
+        rng.shuffle(group_order)
+
+        all_indices: List[int] = []
+        for i in range(0, len(group_order), self.window_blocks):
+            window = group_order[i : i + self.window_blocks]
+            chunk: List[int] = []
+            for g_idx in window:
+                chunk.extend(self.groups[g_idx])
+            rng.shuffle(chunk)
+            all_indices.extend(chunk)
+
+        yield from all_indices
+
+    def __len__(self) -> int:
+        return sum(len(g) for g in self.groups)
+
+

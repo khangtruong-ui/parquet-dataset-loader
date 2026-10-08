@@ -161,6 +161,31 @@ def load_dataset(
 
     target_splits = [base_split] if base_split else list(splits_map.keys())
 
+    # Auto-discover existing local downloaded Parquet files in cache directory
+    safe_repo_name = (
+        str(path).replace("/", "_").replace(":", "_") if isinstance(path, str) else "dataset"
+    )
+    for s in target_splits:
+        urls = splits_map[s]
+        remote_urls = [u for u in urls if u.startswith(("http://", "https://"))]
+        if remote_urls:
+            split_dl_dir = os.path.join(resolved_cache_dir, "downloads", safe_repo_name, s)
+            if os.path.isdir(split_dl_dir):
+                local_candidates = [
+                    os.path.join(split_dl_dir, f)
+                    for f in os.listdir(split_dl_dir)
+                    if f.endswith((".parquet", ".pq"))
+                ]
+                if len(local_candidates) >= len(urls) and len(local_candidates) > 0:
+                    logger.info(
+                        "Found %d cached local Parquet files in '%s' for split '%s'. "
+                        "Using local files for instant zero-network access.",
+                        len(local_candidates),
+                        split_dl_dir,
+                        s,
+                    )
+                    splits_map[s] = sorted(local_candidates)
+
     # Determine whether progressive disk persistence is requested.
     # Default is False when streaming=True.
     should_save_to_disk = bool(save_to_disk)
@@ -174,9 +199,6 @@ def load_dataset(
             urls = splits_map[s]
             remote_urls = [u for u in urls if u.startswith(("http://", "https://"))]
             if remote_urls:
-                safe_repo_name = (
-                    str(path).replace("/", "_").replace(":", "_") if isinstance(path, str) else "dataset"
-                )
                 split_dl_dir = os.path.join(resolved_cache_dir, "downloads", safe_repo_name, s)
                 local_files = download_parquet_files(
                     urls=urls,
