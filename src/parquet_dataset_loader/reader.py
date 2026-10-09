@@ -6,8 +6,10 @@ range requests or local disk, applying column projection, and managing connectio
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -21,6 +23,8 @@ from tqdm import tqdm
 from parquet_dataset_loader.cache import DiskCache, RowGroupMemoryCache
 from parquet_dataset_loader.exceptions import CorruptParquetError, ParquetDatasetError
 from parquet_dataset_loader.hf_resolver import create_retry_session, resolve_hf_token
+
+logger = logging.getLogger("parquet_dataset_loader.reader")
 
 
 class RowGroupReader:
@@ -44,6 +48,9 @@ class RowGroupReader:
         token: Optional[Union[bool, str]] = None,
         block_size: int = 2 * 1024 * 1024,  # 2 MB default block size
         max_open_files: int = 8,
+        max_retries: int = 5,
+        retry_delay: float = 0.5,
+        max_retry_delay: float = 8.0,
     ) -> None:
         self.memory_cache = (
             memory_cache if memory_cache is not None else RowGroupMemoryCache(max_entries=2)
@@ -53,6 +60,9 @@ class RowGroupReader:
         self.token = resolve_hf_token(token)
         self.block_size = block_size
         self.max_open_files = max(1, max_open_files)
+        self.max_retries = max(1, int(max_retries))
+        self.retry_delay = float(retry_delay)
+        self.max_retry_delay = float(max_retry_delay)
 
         self._open_files: OrderedDict[str, Tuple[Any, pq.ParquetFile]] = OrderedDict()
         self._lock = threading.Lock()
@@ -78,25 +88,49 @@ class RowGroupReader:
                 self._open_files.clear()
         return self._http_fs
 
-    def _get_parquet_file(self, file_url_or_path: str) -> pq.ParquetFile:
-        """Obtain a reusable ParquetFile instance for the specified file."""
-        # Ensure filesystem is initialized for current process
-        _ = self.http_fs
+    def _evict_file(self, file_url_or_path: str) -> None:
+        """Safely close and remove an open file handle from cache."""
         with self._lock:
             if file_url_or_path in self._open_files:
-                self._open_files.move_to_end(file_url_or_path)
-                _, pf = self._open_files[file_url_or_path]
-                return pf
-
-            # Close oldest file handle if capacity reached
-            if len(self._open_files) >= self.max_open_files:
-                oldest_url, (fp, _) = self._open_files.popitem(last=False)
+                fp, _ = self._open_files.pop(file_url_or_path)
                 try:
                     fp.close()
                 except Exception:
                     pass
 
-            is_remote = file_url_or_path.startswith(("http://", "https://"))
+    def reset_filesystem(self) -> None:
+        """Close all open files and reset HTTP filesystem connection pool."""
+        with self._lock:
+            for _, (fp, _) in list(self._open_files.items()):
+                try:
+                    fp.close()
+                except Exception:
+                    pass
+            self._open_files.clear()
+            self._http_fs = None
+            self._http_fs_pid = None
+
+    def _get_parquet_file(self, file_url_or_path: str, max_attempts: int = 3) -> pq.ParquetFile:
+        """Obtain a reusable ParquetFile instance for the specified file with retry on remote open."""
+        is_remote = file_url_or_path.startswith(("http://", "https://"))
+        attempts = max_attempts if is_remote else 1
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(attempts):
+            _ = self.http_fs
+            with self._lock:
+                if file_url_or_path in self._open_files:
+                    self._open_files.move_to_end(file_url_or_path)
+                    _, pf = self._open_files[file_url_or_path]
+                    return pf
+
+                if len(self._open_files) >= self.max_open_files:
+                    oldest_url, (fp, _) = self._open_files.popitem(last=False)
+                    try:
+                        fp.close()
+                    except Exception:
+                        pass
+
             fp = None
             try:
                 if is_remote:
@@ -106,16 +140,30 @@ class RowGroupReader:
                     abs_path = os.path.abspath(os.path.expanduser(file_url_or_path))
                     fp = open(abs_path, "rb")
                     pf = pq.ParquetFile(fp, memory_map=True)
-            except Exception:
+
+                with self._lock:
+                    self._open_files[file_url_or_path] = (fp, pf)
+                return pf
+            except Exception as exc:
+                last_exc = exc
                 if fp is not None:
                     try:
                         fp.close()
                     except Exception:
                         pass
-                raise
+                if is_remote and attempt < attempts - 1:
+                    logger.warning(
+                        f"⚠️ Error opening remote ParquetFile '{file_url_or_path}' "
+                        f"(attempt {attempt + 1}/{attempts}): {exc}. Resetting filesystem and retrying..."
+                    )
+                    self.reset_filesystem()
+                    time.sleep(min(self.max_retry_delay, self.retry_delay * (2 ** attempt)))
+                else:
+                    break
 
-            self._open_files[file_url_or_path] = (fp, pf)
-            return pf
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"Failed to open ParquetFile for {file_url_or_path}")
 
     def read_row_group(
         self,
@@ -125,6 +173,10 @@ class RowGroupReader:
         file_index: int = 0,
     ) -> pa.Table:
         """Read a single row group table, checking memory, progressive, and disk caches first.
+
+        Automatically handles transient HTTP stream disconnects, payload truncations, and
+        network errors when reading remote Parquet files by performing exponential backoff
+        retries and recycling open file handles.
 
         Args:
             file_url: URL or local path to the Parquet file.
@@ -136,7 +188,7 @@ class RowGroupReader:
             Decoded PyArrow Table containing the rows of this row group.
 
         Raises:
-            CorruptParquetError: If reading or decoding the row group fails.
+            CorruptParquetError: If reading or decoding the row group fails after exhausting retries.
         """
         # 1. Check in-memory LRU cache
         cached = self.memory_cache.get(file_url, rg_index, columns)
@@ -157,14 +209,40 @@ class RowGroupReader:
                 self.memory_cache.put(file_url, rg_index, cached_disk, columns)
                 return cached_disk
 
-        # 4. Read from source (remote HTTP range request or local disk)
-        try:
-            pf = self._get_parquet_file(file_url)
-            table = pf.read_row_group(rg_index, columns=list(columns) if columns else None)
-        except Exception as e:
+        # 4. Read from source with automatic retries on transient network/IO errors
+        is_remote = file_url.startswith(("http://", "https://"))
+        max_attempts = self.max_retries if is_remote else 1
+        last_error: Optional[Exception] = None
+
+        for attempt in range(max_attempts):
+            try:
+                pf = self._get_parquet_file(file_url)
+                table = pf.read_row_group(rg_index, columns=list(columns) if columns else None)
+                break
+            except Exception as e:
+                last_error = e
+                # Evict the potentially severed/corrupted file handle from pool
+                self._evict_file(file_url)
+                if is_remote and attempt < max_attempts - 1:
+                    delay = min(self.max_retry_delay, self.retry_delay * (2 ** attempt))
+                    logger.warning(
+                        f"⚠️ Transient error reading row group {rg_index} from '{file_url}' "
+                        f"(attempt {attempt + 1}/{max_attempts}): {e}. "
+                        f"Resetting connection and retrying in {delay:.2f}s..."
+                    )
+                    # For payload/network stream errors, reset filesystem to establish fresh HTTP session
+                    self.reset_filesystem()
+                    time.sleep(delay)
+                else:
+                    raise CorruptParquetError(
+                        file_url,
+                        f"Failed reading row group {rg_index} after {attempt + 1} attempt(s): {e}",
+                    ) from e
+        else:
             raise CorruptParquetError(
-                file_url, f"Failed reading row group {rg_index}: {e}"
-            ) from e
+                file_url,
+                f"Failed reading row group {rg_index} after exhausting {max_attempts} retries: {last_error}",
+            ) from last_error
 
         # 5. Save to progressive disk saver if configured
         if self.progressive_saver is not None:
@@ -181,13 +259,7 @@ class RowGroupReader:
 
     def close(self) -> None:
         """Close all open file handles and clear caches."""
-        with self._lock:
-            for _, (fp, _) in self._open_files.items():
-                try:
-                    fp.close()
-                except Exception:
-                    pass
-            self._open_files.clear()
+        self.reset_filesystem()
         self.memory_cache.clear()
 
     def __getstate__(self) -> Dict[str, Any]:

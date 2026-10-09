@@ -116,3 +116,71 @@ def test_row_group_reader_default_capacity_eviction(temp_dir: str) -> None:
     finally:
         reader.close()
 
+
+def test_row_group_reader_retry_on_transient_error(temp_dir: str) -> None:
+    """Test that RowGroupReader retries and recovers from transient remote reading errors."""
+    f1 = os.path.join(temp_dir, "test_retry.parquet")
+    create_sample_parquet_file(f1, num_rows=30, row_group_size=10)
+
+    reader = RowGroupReader(max_retries=3, retry_delay=0.01, max_retry_delay=0.05)
+    call_count = 0
+    original_get = reader._get_parquet_file
+
+    def flaky_get_parquet_file(url: str):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            raise ConnectionResetError(f"Simulated network drop on attempt {call_count}")
+        return original_get(f1)
+
+    reader._get_parquet_file = flaky_get_parquet_file
+
+    try:
+        # Use remote URL prefix to trigger retry logic
+        tbl = reader.read_row_group("https://example.com/dataset/flaky.parquet", 0)
+        assert tbl.num_rows == 10
+        assert call_count == 3  # Succeeded on 3rd attempt
+    finally:
+        reader.close()
+
+
+def test_row_group_reader_exhausted_retries_raises_corrupt_parquet_error() -> None:
+    """Test that exhausting all retries on persistent errors raises CorruptParquetError."""
+    reader = RowGroupReader(max_retries=3, retry_delay=0.01, max_retry_delay=0.02)
+
+    def always_fail_get(url: str):
+        raise OSError("Connection timed out completely")
+
+    reader._get_parquet_file = always_fail_get
+
+    try:
+        with pytest.raises(CorruptParquetError) as exc_info:
+            reader.read_row_group("https://example.com/bad.parquet", 0)
+        assert "attempt" in str(exc_info.value).lower()
+    finally:
+        reader.close()
+
+
+def test_row_group_reader_evict_and_reset_filesystem(temp_dir: str) -> None:
+    """Test explicit handle eviction and filesystem connection pool reset."""
+    f1 = os.path.join(temp_dir, "test_evict.parquet")
+    create_sample_parquet_file(f1, num_rows=10, row_group_size=10)
+
+    reader = RowGroupReader()
+    try:
+        reader.read_row_group(f1, 0)
+        assert f1 in reader._open_files
+        reader._evict_file(f1)
+        assert f1 not in reader._open_files
+
+        # Test reset_filesystem
+        reader.memory_cache.clear()
+        reader.read_row_group(f1, 0)
+        assert len(reader._open_files) == 1
+        reader.reset_filesystem()
+        assert len(reader._open_files) == 0
+        assert reader._http_fs is None
+    finally:
+        reader.close()
+
+
