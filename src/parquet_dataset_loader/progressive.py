@@ -293,6 +293,7 @@ class BackgroundDownloader:
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._executor: Any = None
 
     def start(self) -> None:
         """Start the background downloader thread."""
@@ -343,20 +344,35 @@ class BackgroundDownloader:
                 )
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            for rg in ordered_rgs:
-                if self._stop_event.is_set():
-                    break
-                file_idx = rg.file_index if hasattr(rg, "file_index") else rg[0]
-                rg_idx = rg.rg_index if hasattr(rg, "rg_index") else rg[1]
-                if self.progressive_saver.is_saved(file_idx, rg_idx):
-                    continue
-                executor.submit(_fetch_rg, rg)
-                if self.delay_between_requests > 0:
-                    time.sleep(self.delay_between_requests)
+            self._executor = executor
+            try:
+                for rg in ordered_rgs:
+                    if self._stop_event.is_set():
+                        break
+                    file_idx = rg.file_index if hasattr(rg, "file_index") else rg[0]
+                    rg_idx = rg.rg_index if hasattr(rg, "rg_index") else rg[1]
+                    if self.progressive_saver.is_saved(file_idx, rg_idx):
+                        continue
+                    if self._stop_event.is_set():
+                        break
+                    try:
+                        executor.submit(_fetch_rg, rg)
+                    except RuntimeError:
+                        break
+                    if self.delay_between_requests > 0:
+                        time.sleep(self.delay_between_requests)
+            finally:
+                self._executor = None
 
     def stop(self) -> None:
-        """Signal the background worker to stop."""
+        """Signal the background worker to stop immediately."""
         self._stop_event.set()
+        executor = self._executor
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
 
     def join(self, timeout: Optional[float] = None) -> None:
         """Wait for the background worker thread to finish."""

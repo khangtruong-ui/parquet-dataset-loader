@@ -39,10 +39,12 @@ from parquet_dataset_loader.index import (
 )
 from parquet_dataset_loader.manager import (
     DatasetManager,
+    cleanup_background_tasks,
     close_all_datasets,
     get_dataset_manager,
     list_active_datasets,
     managed_datasets,
+    stop_all_background_tasks,
 )
 from parquet_dataset_loader.progressive import BackgroundDownloader, ProgressiveDiskSaver
 from parquet_dataset_loader.reader import RowGroupReader, download_parquet_files
@@ -62,6 +64,8 @@ __all__ = [
     "get_dataset_manager",
     "list_active_datasets",
     "close_all_datasets",
+    "stop_all_background_tasks",
+    "cleanup_background_tasks",
     "managed_datasets",
     "MetadataIndex",
     "ParquetFileInfo",

@@ -170,6 +170,19 @@ class DatasetManager:
             self._datasets.clear()
             return count
 
+    def stop_all_background_tasks(self) -> int:
+        """Stop all background downloaders across all registered datasets."""
+        with self._lock:
+            count = 0
+            for ds in self._datasets.values():
+                if hasattr(ds, "stop_background_download"):
+                    try:
+                        ds.stop_background_download()
+                        count += 1
+                    except Exception as e:
+                        logger.warning("Error stopping background download: %s", e)
+            return count
+
     @property
     def active_count(self) -> int:
         """Number of active datasets currently managed."""
@@ -221,6 +234,19 @@ def list_active_datasets() -> Dict[str, Dict[str, Any]]:
 def close_all_datasets() -> int:
     """Close all currently active managed datasets across the process."""
     return get_dataset_manager().close_all()
+
+
+def stop_all_background_tasks() -> int:
+    """Stop all background downloaders across all registered datasets."""
+    return get_dataset_manager().stop_all_background_tasks()
+
+
+def cleanup_background_tasks() -> int:
+    """Stop all background downloads, close all active datasets, and release resources."""
+    mgr = get_dataset_manager()
+    bg_count = mgr.stop_all_background_tasks()
+    ds_count = mgr.close_all()
+    return bg_count + ds_count
 
 
 @contextlib.contextmanager

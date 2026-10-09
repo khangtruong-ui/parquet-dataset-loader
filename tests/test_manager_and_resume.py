@@ -354,3 +354,46 @@ def test_load_from_disk_resume_flag(temp_dir: str) -> None:
     # Read remaining rows
     assert resumed_ds[7] is not None
     resumed_ds.close()
+
+
+def test_stop_all_background_tasks_and_cleanup(temp_dir: str, sample_dataset_dir: str) -> None:
+    from parquet_dataset_loader.manager import (
+        close_all_datasets,
+        cleanup_background_tasks,
+        get_dataset_manager,
+        stop_all_background_tasks,
+    )
+    from parquet_dataset_loader.cli import cli_kill, cleanup_stale_cache_files
+
+    # Create dummy temp file in cache dir
+    dummy_tmp = os.path.join(temp_dir, "test.tmp.feather")
+    with open(dummy_tmp, "w") as f:
+        f.write("temporary data")
+    assert os.path.exists(dummy_tmp)
+    removed = cleanup_stale_cache_files(temp_dir)
+    assert removed == 1
+    assert not os.path.exists(dummy_tmp)
+
+    # Test load with background download and manager stopping
+    ds = load_dataset(
+        sample_dataset_dir,
+        streaming=True,
+        save_to_disk=os.path.join(temp_dir, "ds_stop"),
+        background_download=True,
+        manage=True,
+    )
+    assert get_dataset_manager().active_count >= 1
+
+    # Call stop_all_background_tasks
+    stopped = stop_all_background_tasks()
+    assert stopped >= 1
+
+    # Call cleanup_background_tasks
+    cleaned = cleanup_background_tasks()
+    assert cleaned >= 1
+    assert get_dataset_manager().active_count == 0
+
+    # Call cli_kill
+    exit_code = cli_kill(["--cache-dir", temp_dir, "-q"])
+    assert exit_code == 0
+

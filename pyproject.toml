@@ -50,6 +50,9 @@ dev = [
     "pytest-cov>=4.0.0",
 ]
 
+[project.scripts]
+pdl-kill = "parquet_dataset_loader.cli:cli_kill"
+
 [project.urls]
 Homepage = "https://github.com/khangtruong-ui/parquet-dataset-loader"
 Repository = "https://github.com/khangtruong-ui/parquet-dataset-loader"
