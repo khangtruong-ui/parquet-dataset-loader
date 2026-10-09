@@ -85,6 +85,11 @@ class RowGroupReader:
             self._http_fs_pid = current_pid
             self._lock = threading.Lock()
             if hasattr(self, "_open_files"):
+                for _, (fp, _) in list(self._open_files.items()):
+                    try:
+                        fp.close()
+                    except Exception:
+                        pass
                 self._open_files.clear()
         return self._http_fs
 

@@ -129,6 +129,10 @@ class RowGroupMemoryCache:
     def __getstate__(self) -> Dict[str, Any]:
         state = self.__dict__.copy()
         state.pop("_lock", None)
+        # Avoid duplicating cached tables into spawned worker processes
+        state["_cache"] = OrderedDict()
+        state["hits"] = 0
+        state["misses"] = 0
         return state
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
