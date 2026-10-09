@@ -1039,7 +1039,7 @@ class BlockShuffledSampler:
     def __init__(
         self,
         dataset: Any,
-        window_blocks: int = 2,
+        window_blocks: int = 1,
         seed: int = 42,
         shuffle: bool = True,
     ) -> None:
@@ -1055,6 +1055,16 @@ class BlockShuffledSampler:
             self.groups = dataset.pdl_dataset.get_row_group_indices()
         else:
             self.groups = [list(range(len(dataset)))]
+
+        ds_len = len(dataset)
+        total_in_groups = sum(len(g) for g in self.groups)
+        if ds_len < total_in_groups:
+            filtered_groups = []
+            for g in self.groups:
+                valid_g = [i for i in g if i < ds_len]
+                if valid_g:
+                    filtered_groups.append(valid_g)
+            self.groups = filtered_groups
 
     def set_epoch(self, epoch: int) -> None:
         """Set epoch index to vary shuffling permutation deterministically across epochs."""

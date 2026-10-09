@@ -145,7 +145,13 @@ class ProgressiveDiskSaver:
     def is_saved(self, file_idx: int, rg_idx: int) -> bool:
         """Check if a specific row group has been saved to disk."""
         with self._lock:
-            return (file_idx, rg_idx) in self._saved_rgs
+            if (file_idx, rg_idx) in self._saved_rgs:
+                return True
+            filepath = self._rg_filename(file_idx, rg_idx)
+            if os.path.exists(filepath):
+                self._saved_rgs.add((file_idx, rg_idx))
+                return True
+            return False
 
     def get(
         self,
@@ -182,7 +188,7 @@ class ProgressiveDiskSaver:
     ) -> None:
         """Save a decoded row group table to disk."""
         with self._lock:
-            if (file_idx, rg_idx) in self._saved_rgs:
+            if self.is_saved(file_idx, rg_idx):
                 return
 
             filepath = self._rg_filename(file_idx, rg_idx)
@@ -201,6 +207,7 @@ class ProgressiveDiskSaver:
                     except OSError:
                         pass
                 logger.warning("Failed writing row group to disk: %s", e)
+
 
     @property
     def saved_count(self) -> int:
@@ -271,6 +278,7 @@ class BackgroundDownloader:
         columns: Optional[Sequence[str]] = None,
         delay_between_requests: float = 0.02,
         start_rg_index: int = 0,
+        max_workers: int = 4,
     ) -> None:
         self.reader = reader
         self.row_groups = row_groups
@@ -281,6 +289,7 @@ class BackgroundDownloader:
         self.columns = columns
         self.delay_between_requests = delay_between_requests
         self.start_rg_index = max(0, min(start_rg_index, len(row_groups)))
+        self.max_workers = max(1, int(max_workers))
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -298,8 +307,9 @@ class BackgroundDownloader:
         self._thread.start()
 
     def _run(self) -> None:
-        """Background worker loop with forward prefetching from start_rg_index."""
-        # Prioritize downloading forward from start_rg_index, then earlier row groups
+        """Background worker loop with concurrent prefetching from start_rg_index."""
+        from concurrent.futures import ThreadPoolExecutor
+
         if 0 < self.start_rg_index < len(self.row_groups):
             ordered_rgs = list(self.row_groups[self.start_rg_index:]) + list(
                 self.row_groups[: self.start_rg_index]
@@ -307,20 +317,17 @@ class BackgroundDownloader:
         else:
             ordered_rgs = list(self.row_groups)
 
-        for rg in ordered_rgs:
+        def _fetch_rg(rg: Any) -> None:
             if self._stop_event.is_set():
-                break
-
+                return
             file_idx = rg.file_index if hasattr(rg, "file_index") else rg[0]
             rg_idx = rg.rg_index if hasattr(rg, "rg_index") else rg[1]
             file_url = getattr(rg, "file_url", "")
 
-            # If already saved by foreground thread or earlier run, skip
             if self.progressive_saver.is_saved(file_idx, rg_idx):
-                continue
+                return
 
             try:
-                # Reading triggers reader caching and progressive saving automatically
                 self.reader.read_row_group(
                     file_url=file_url,
                     rg_index=rg_idx,
@@ -335,8 +342,17 @@ class BackgroundDownloader:
                     e,
                 )
 
-            if self.delay_between_requests > 0:
-                time.sleep(self.delay_between_requests)
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            for rg in ordered_rgs:
+                if self._stop_event.is_set():
+                    break
+                file_idx = rg.file_index if hasattr(rg, "file_index") else rg[0]
+                rg_idx = rg.rg_index if hasattr(rg, "rg_index") else rg[1]
+                if self.progressive_saver.is_saved(file_idx, rg_idx):
+                    continue
+                executor.submit(_fetch_rg, rg)
+                if self.delay_between_requests > 0:
+                    time.sleep(self.delay_between_requests)
 
     def stop(self) -> None:
         """Signal the background worker to stop."""
