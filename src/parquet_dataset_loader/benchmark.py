@@ -6,6 +6,7 @@ Allows evaluating the performance of streaming dataset loading.
 import argparse
 import sys
 import time
+import statistics
 
 import parquet_dataset_loader as pdl
 
@@ -13,7 +14,7 @@ import parquet_dataset_loader as pdl
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         prog="pdl-benchmark",
-        description="Benchmark streaming dataset load times and random access.",
+        description="Benchmark streaming dataset load times and random access scientifically.",
     )
     parser.add_argument(
         "--path",
@@ -46,16 +47,75 @@ def parse_args(argv=None):
         default=50000,
         help="The index to jump to for random access benchmark.",
     )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=1,
+        help="Number of measurement runs for each operation.",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=0,
+        help="Number of warmup runs before measurement begins.",
+    )
     return parser.parse_args(argv)
+
+
+def measure_operation(name, func, runs=1, warmup=0, scale_to_ms=False):
+    """Measures execution time of a callable multiple times and reports stats."""
+
+    # Warmup phase
+    for _ in range(warmup):
+        try:
+            func()
+        except Exception as e:
+            print(f"Failed during warmup of '{name}': {e}")
+            return
+
+    times = []
+    # Measurement phase
+    for _ in range(runs):
+        try:
+            t0 = time.perf_counter()
+            func()
+            t1 = time.perf_counter()
+            times.append(t1 - t0)
+        except Exception as e:
+            print(f"Failed to measure '{name}': {e}")
+            return
+
+    if not times:
+        return
+
+    # Scaling to ms if requested
+    factor = 1000.0 if scale_to_ms else 1.0
+    unit = "ms" if scale_to_ms else "s"
+
+    times = [t * factor for t in times]
+
+    if len(times) == 1:
+        print(f"{name}: {times[0]:.3f} {unit}")
+    else:
+        mean_t = statistics.mean(times)
+        min_t = min(times)
+        max_t = max(times)
+        if len(times) > 1:
+            stdev = statistics.stdev(times)
+            print(f"{name}: Mean: {mean_t:.3f} {unit} | Min: {min_t:.3f} {unit} | Max: {max_t:.3f} {unit} | Stdev: {stdev:.3f} {unit}")
+        else:
+            print(f"{name}: {times[0]:.3f} {unit}")
 
 
 def run_benchmark(args):
     print("=" * 70)
     print(f"Benchmarking Dataset: {args.path} (split: {args.split})")
+    print(f"Runs: {args.runs} | Warmup: {args.warmup}")
     print("=" * 70)
 
-    # 1. Initialization
-    t0 = time.time()
+    # Note: We only run initialization once, since repeated load_dataset
+    # creates multiple instances and we want to benchmark the operations on *one* instance.
+    t0 = time.perf_counter()
     ds = pdl.load_dataset(
         path=args.path,
         split=args.split,
@@ -63,12 +123,10 @@ def run_benchmark(args):
         columns=args.columns if args.columns else None,
         max_cached_row_groups=args.max_cached_row_groups,
     )
-    t1 = time.time()
+    t1 = time.perf_counter()
+    print(f"Dataset initialized in: {t1 - t0:.3f} seconds (Note: measured once)")
 
-    print(f"Dataset initialized in: {t1 - t0:.2f} seconds")
-
-    # Avoid evaluating length if len(ds) raises an exception for whatever reason,
-    # though pdl should support len instantly.
+    # Avoid evaluating length if len(ds) raises an exception
     try:
         ds_len = len(ds)
         print(f"Total dataset length: {ds_len:,} rows")
@@ -83,80 +141,42 @@ def run_benchmark(args):
         print("Dataset is empty. Skipping further benchmarks.")
         return 0
 
-    # 2. First index
-    t_start = time.time()
-    try:
-        sample_0 = ds[0]
-        t_end = time.time()
-        print(f"Fetched index 0 in {t_end - t_start:.2f} seconds")
-    except Exception as e:
-        print(f"Failed to fetch index 0: {e}")
+    # 1. First index [0]
+    def get_first():
+        return ds[0]
+    measure_operation("Fetch index 0", get_first, runs=args.runs, warmup=args.warmup, scale_to_ms=False)
 
-    print()
-
-    # 3. Direct jump
+    # 2. Direct jump
     target_idx = args.target_index
     if ds_len > 0 and target_idx >= ds_len:
         target_idx = max(0, ds_len // 2)
 
-    print(f"Seeking to index {target_idx}...")
-    t_start = time.time()
-    try:
-        sample_mid = ds[target_idx]
-        t_end = time.time()
-        print(f"Fetched index {target_idx} in {t_end - t_start:.2f} seconds!")
-    except Exception as e:
-        print(f"Failed to fetch index {target_idx}: {e}")
+    def jump_mid():
+        return ds[target_idx]
+    measure_operation(f"Seek to index {target_idx}", jump_mid, runs=args.runs, warmup=args.warmup, scale_to_ms=False)
 
-    print()
-
-    # 4. Consecutive read
+    # 3. Consecutive read
     next_idx = target_idx + 1
     if ds_len < 0 or next_idx < ds_len:
-        print(f"Reading consecutive sample {next_idx} from in-memory row group cache...")
-        t_start = time.time()
-        try:
-            sample_next = ds[next_idx]
-            t_end = time.time()
-            print(f"Fetched index {next_idx} in {(t_end - t_start)*1000:.3f} ms (cache hit expected)")
-        except Exception as e:
-            print(f"Failed to fetch index {next_idx}: {e}")
-        print()
+        def read_next():
+            return ds[next_idx]
+        measure_operation(f"Read consecutive sample {next_idx} (cache hit)", read_next, runs=args.runs, warmup=args.warmup, scale_to_ms=True)
 
-    # 5. Slicing
+    # 4. Slicing
     slice_end = next_idx + 5
     if ds_len < 0 or slice_end <= ds_len:
-        print(f"Slicing rows [{target_idx}:{slice_end}]...")
-        t_start = time.time()
-        try:
-            batch = ds[target_idx:slice_end]
-            t_end = time.time()
+        def slice_data():
+            return ds[target_idx:slice_end]
+        measure_operation(f"Slice rows [{target_idx}:{slice_end}]", slice_data, runs=args.runs, warmup=args.warmup, scale_to_ms=True)
 
-            # just get length of first column value
-            if isinstance(batch, dict) and len(batch) > 0:
-                first_col = list(batch.keys())[0]
-                slice_len = len(batch[first_col])
-            else:
-                slice_len = len(batch)
-
-            print(f"Sliced batch of {slice_len} items in {(t_end - t_start)*1000:.3f} ms")
-        except Exception as e:
-            print(f"Failed to slice: {e}")
-        print()
-
-    # 6. Streaming
-    print("Streaming 3 rows...")
-    try:
-        t_start = time.time()
+    # 5. Streaming
+    def stream_data():
         count = 0
-        for idx, item in enumerate(ds.iter_from(target_idx)):
+        for _ in ds.iter_from(target_idx):
             count += 1
             if count >= 3:
                 break
-        t_end = time.time()
-        print(f"Streamed {count} rows in {(t_end - t_start)*1000:.3f} ms")
-    except Exception as e:
-        print(f"Failed to stream: {e}")
+    measure_operation("Stream 3 rows", stream_data, runs=args.runs, warmup=args.warmup, scale_to_ms=True)
 
     print("=" * 70)
     print("Benchmark completed.")

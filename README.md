@@ -514,6 +514,37 @@ assert len(sub_ds) == 4
 
 ---
 
+## Command-Line Interfaces (CLI)
+
+`parquet-dataset-loader` provides a set of highly usable CLI commands installed directly into your environment:
+
+### `pdl-benchmark`
+Evaluate and benchmark dataset streaming performance, network latency, and random access speeds scientifically.
+
+```bash
+# Benchmark the KhangTruong/COCO-inpainted dataset, measuring only the 'mask' column.
+# Runs the benchmark 3 times after 1 warmup run.
+pdl-benchmark --path KhangTruong/COCO-inpainted --split train \
+              --columns mask --target-index 50000 --runs 3 --warmup 1
+```
+
+**Options:**
+- `--path`: Hugging Face dataset ID or local path (default: `KhangTruong/COCO-inpainted`).
+- `--split`: Dataset split to benchmark (default: `train`).
+- `--columns`: List of columns to project/load. (default: `mask`).
+- `--target-index`: The exact row index to jump to for testing network seek latency (default: `50000`).
+- `--runs`: Number of measurement iterations for calculating mean, min, max, stdev (default: `1`).
+- `--warmup`: Number of warmup iterations to exclude from measurement (default: `0`).
+
+### `pdl-kill`
+Stop all background downloaders and clean temporary cache files. Useful if background tasks get stuck or to clear out stale temporary downloads.
+
+```bash
+pdl-kill --quiet
+```
+
+---
+
 ## API Reference & Default Parameter Values
 
 ### `load_dataset(...)` Default Parameters Reference

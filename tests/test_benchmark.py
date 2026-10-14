@@ -10,13 +10,17 @@ def test_parse_args_defaults():
     assert args.columns == ["mask"]
     assert args.max_cached_row_groups == 2
     assert args.target_index == 50000
+    assert args.runs == 1
+    assert args.warmup == 0
 
 def test_parse_args_custom():
-    args = parse_args(["--path", "my-dataset", "--split", "test", "--columns", "a", "b", "--target-index", "100"])
+    args = parse_args(["--path", "my-dataset", "--split", "test", "--columns", "a", "b", "--target-index", "100", "--runs", "5", "--warmup", "2"])
     assert args.path == "my-dataset"
     assert args.split == "test"
     assert args.columns == ["a", "b"]
     assert args.target_index == 100
+    assert args.runs == 5
+    assert args.warmup == 2
 
 @patch("parquet_dataset_loader.benchmark.pdl.load_dataset")
 def test_run_benchmark(mock_load_dataset, capsys):
@@ -50,6 +54,6 @@ def test_run_benchmark(mock_load_dataset, capsys):
     captured = capsys.readouterr()
     assert "Benchmarking Dataset: dummy" in captured.out
     assert "Total dataset length: 1,000 rows" in captured.out
-    assert "Fetched index 0" in captured.out
-    assert "Seeking to index 500" in captured.out
-    assert "Streaming 3 rows" in captured.out
+    assert "Fetch index 0" in captured.out
+    assert "Seek to index 500" in captured.out
+    assert "Stream 3 rows" in captured.out
