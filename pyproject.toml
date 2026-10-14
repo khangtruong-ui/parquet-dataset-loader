@@ -52,6 +52,7 @@ dev = [
 
 [project.scripts]
 pdl-kill = "parquet_dataset_loader.cli:cli_kill"
+pdl-benchmark = "parquet_dataset_loader.benchmark:main"
 
 [project.urls]
 Homepage = "https://github.com/khangtruong-ui/parquet-dataset-loader"
