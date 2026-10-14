@@ -151,6 +151,30 @@ class IndexedParquetDataset(collections.abc.Sequence):
     def _get_slice(self, s: slice) -> Dict[str, List[Any]]:
         """Fetch a slice of rows matching Hugging Face batch format {col: [vals]}."""
         start, stop, step = s.indices(self._length)
+
+        # Fast path for contiguous unshuffled slices
+        if step == 1 and self.indices is None:
+            if start >= stop:
+                return {col: [] for col in self.column_names}
+
+            global_start = self.offset + start
+            global_stop = self.offset + stop
+            ranges = self.index.locate_range(global_start, global_stop)
+
+            batch: Dict[str, List[Any]] = {col: [] for col in self.column_names}
+            for rg_info, local_start, local_stop in ranges:
+                table = self.reader.read_row_group(
+                    file_url=rg_info.file_url,
+                    rg_index=rg_info.rg_index,
+                    columns=self.columns,
+                    file_index=rg_info.file_index,
+                )
+                sub_table = table.slice(local_start, local_stop - local_start)
+                pydict = sub_table.to_pydict()
+                for col in self.column_names:
+                    batch[col].extend(pydict.get(col, []))
+            return batch
+
         indices = list(range(start, stop, step))
         return self._get_indices(indices)
 
