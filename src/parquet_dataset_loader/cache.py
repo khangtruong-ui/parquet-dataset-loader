@@ -5,18 +5,25 @@ This module provides:
    ensuring that memory usage remains strictly bounded regardless of dataset size.
 2. DiskCache: An optional on-disk cache using PyArrow Feather (IPC) format for
    memory-mapped zero-copy re-reads of remote row groups.
+3. FileCache: An LRU and forward-caching manager for remote Parquet files on local disk,
+   maintaining a bounded window of downloaded files regulated by file count or size (GBs).
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import threading
+import time
 from collections import OrderedDict
-from typing import Dict, Optional, Sequence, Tuple, Union
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import pyarrow as pa
 import pyarrow.feather as feather
+
+logger = logging.getLogger(__name__)
 
 
 class RowGroupMemoryCache:
@@ -231,4 +238,341 @@ class DiskCache:
     def __setstate__(self, state: Dict[str, Any]) -> None:
         self.__dict__.update(state)
         self._lock = threading.Lock()
+
+
+class FileCache:
+    """Thread-safe LRU and forward-caching manager for remote Parquet files on local disk.
+
+    Maintains a bounded window of downloaded remote Parquet files to eliminate
+    concurrent HTTP socket thrashing, connection timeouts, and 429 rate limits
+    during multi-worker streaming iterations.
+
+    Attributes:
+        cache_dir: Directory where remote Parquet files are stored.
+        max_cached_files: Maximum number of Parquet files to keep on disk simultaneously.
+            If None, file count is unlimited (regulated only by size).
+        max_cache_bytes: Maximum total size on disk in bytes (or max_cache_gb).
+            If None, disk usage is regulated only by file count.
+    """
+
+    def __init__(
+        self,
+        cache_dir: str,
+        max_cached_files: Optional[int] = 4,
+        max_cache_gb: Optional[float] = None,
+        max_cache_bytes: Optional[int] = None,
+        token: Optional[Union[bool, str]] = None,
+        prefetch_ahead: int = 1,
+    ) -> None:
+        self.cache_dir = os.path.abspath(os.path.expanduser(cache_dir))
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+        self.max_cached_files = (
+            max(1, int(max_cached_files)) if max_cached_files is not None else None
+        )
+        if max_cache_bytes is not None:
+            self.max_cache_bytes: Optional[int] = max(1, int(max_cache_bytes))
+        elif max_cache_gb is not None:
+            self.max_cache_bytes = max(1, int(float(max_cache_gb) * 1024 * 1024 * 1024))
+        else:
+            self.max_cache_bytes = None
+
+        self.token = token
+        self.prefetch_ahead = max(0, int(prefetch_ahead))
+
+        self._lock = threading.RLock()
+        self._file_locks: Dict[str, threading.Lock] = {}
+        self._active_refs: Dict[str, int] = {}
+        self._access_times: Dict[str, float] = {}  # url -> last access time
+        self._file_sequence: List[str] = []
+        self._prefetch_executor: Optional[ThreadPoolExecutor] = None
+        self._prefetch_futures: Dict[str, Future] = {}
+        self._session: Optional[Any] = None
+
+        self._discover_existing_files()
+
+    def _url_to_path(self, file_url: str) -> str:
+        clean_url = file_url.split("?")[0]
+        base = os.path.basename(clean_url)
+        if not base.endswith((".parquet", ".pq")):
+            base = f"{base}.parquet"
+        hasher = hashlib.sha256(clean_url.encode("utf-8"))
+        h_prefix = hasher.hexdigest()[:12]
+        return os.path.join(self.cache_dir, f"{h_prefix}_{base}")
+
+    def _discover_existing_files(self) -> None:
+        """Scan cache directory for already downloaded Parquet files and clean stale temps."""
+        if not os.path.isdir(self.cache_dir):
+            return
+        with self._lock:
+            try:
+                for fname in os.listdir(self.cache_dir):
+                    fpath = os.path.join(self.cache_dir, fname)
+                    if fname.endswith((".part", ".tmp")):
+                        try:
+                            os.remove(fpath)
+                        except OSError:
+                            pass
+                    elif fname.endswith((".parquet", ".pq")):
+                        try:
+                            mtime = os.path.getmtime(fpath)
+                            self._access_times[fpath] = mtime
+                        except OSError:
+                            pass
+            except Exception as e:
+                logger.warning("Error discovering existing cached files in %s: %s", self.cache_dir, e)
+            self._enforce_limits()
+
+    @property
+    def session(self) -> Any:
+        if self._session is None:
+            from parquet_dataset_loader.hf_resolver import create_retry_session
+            self._session = create_retry_session()
+        return self._session
+
+    def acquire_file(self, file_url: str) -> None:
+        """Increment active reference count to prevent eviction while an open file handle exists."""
+        with self._lock:
+            self._active_refs[file_url] = self._active_refs.get(file_url, 0) + 1
+
+    def release_file(self, file_url: str) -> None:
+        """Decrement active reference count when a file handle is closed."""
+        with self._lock:
+            if file_url in self._active_refs:
+                self._active_refs[file_url] = max(0, self._active_refs[file_url] - 1)
+                if self._active_refs[file_url] == 0:
+                    del self._active_refs[file_url]
+
+    def set_file_sequence(self, file_urls: Sequence[str]) -> None:
+        """Set the expected sequence of files to enable forward prefetching."""
+        with self._lock:
+            self._file_sequence = list(file_urls)
+
+    def is_cached(self, file_url: str) -> bool:
+        """Check if a remote file is already downloaded and present in local cache."""
+        if not file_url.startswith(("http://", "https://")):
+            return True
+        path = self._url_to_path(file_url)
+        return os.path.exists(path) and os.path.getsize(path) > 0
+
+    def get_or_download(self, file_url: str) -> str:
+        """Get local cached path for a remote Parquet file, downloading it if necessary."""
+        if not file_url.startswith(("http://", "https://")):
+            return os.path.abspath(os.path.expanduser(file_url))
+
+        target_path = self._url_to_path(file_url)
+
+        with self._lock:
+            if file_url not in self._file_locks:
+                self._file_locks[file_url] = threading.Lock()
+            flock = self._file_locks[file_url]
+
+        with flock:
+            if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+                with self._lock:
+                    self._access_times[file_url] = time.time()
+                self._trigger_forward_prefetch(file_url)
+                return target_path
+
+            # Check if active prefetch is downloading it
+            fut = None
+            with self._lock:
+                if file_url in self._prefetch_futures:
+                    fut = self._prefetch_futures[file_url]
+
+            if fut is not None:
+                try:
+                    fut.result()
+                    if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+                        with self._lock:
+                            self._access_times[file_url] = time.time()
+                            self._prefetch_futures.pop(file_url, None)
+                        self._trigger_forward_prefetch(file_url)
+                        return target_path
+                except Exception as e:
+                    logger.warning("Prefetch for '%s' failed: %s. Downloading directly...", file_url, e)
+                    with self._lock:
+                        self._prefetch_futures.pop(file_url, None)
+
+            # Synchronous download
+            self._download_file(file_url, target_path)
+
+            with self._lock:
+                self._access_times[file_url] = time.time()
+                self._enforce_limits(exclude={file_url})
+
+            self._trigger_forward_prefetch(file_url)
+            return target_path
+
+    def _download_file(self, file_url: str, target_path: str) -> str:
+        from parquet_dataset_loader.reader import download_single_file
+        return download_single_file(
+            url=file_url,
+            target_path=target_path,
+            session=self.session,
+            token=self.token,
+        )
+
+    def _trigger_forward_prefetch(self, current_url: str) -> None:
+        if self.prefetch_ahead <= 0 or not self._file_sequence:
+            return
+        with self._lock:
+            try:
+                curr_idx = self._file_sequence.index(current_url)
+            except ValueError:
+                return
+            upcoming = self._file_sequence[curr_idx + 1 : curr_idx + 1 + self.prefetch_ahead]
+        if upcoming:
+            self.prefetch(upcoming)
+
+    def prefetch(self, file_urls: Sequence[str]) -> None:
+        """Submit background download tasks for upcoming remote files."""
+        with self._lock:
+            if self._prefetch_executor is None:
+                self._prefetch_executor = ThreadPoolExecutor(
+                    max_workers=2,
+                    thread_name_prefix="pdl-file-prefetch",
+                )
+            for url in file_urls:
+                if not url.startswith(("http://", "https://")):
+                    continue
+                path = self._url_to_path(url)
+                if os.path.exists(path) and os.path.getsize(path) > 0:
+                    continue
+                if url in self._prefetch_futures and not self._prefetch_futures[url].done():
+                    continue
+
+                def _task(u=url, p=path) -> None:
+                    with self._lock:
+                        if u not in self._file_locks:
+                            self._file_locks[u] = threading.Lock()
+                        flock = self._file_locks[u]
+                    with flock:
+                        if not os.path.exists(p) or os.path.getsize(p) == 0:
+                            try:
+                                self._download_file(u, p)
+                                with self._lock:
+                                    self._access_times[u] = time.time()
+                                    self._enforce_limits(exclude={u})
+                            except Exception as ex:
+                                logger.warning("Background forward-prefetch failed for %s: %s", u, ex)
+
+                self._prefetch_futures[url] = self._prefetch_executor.submit(_task)
+
+    def _enforce_limits(self, exclude: Optional[Set[str]] = None) -> None:
+        """Evict least recently used cached files to satisfy file count and GB limits."""
+        exclude_set = exclude or set()
+        cached: List[Tuple[str, str, int, float]] = []
+        total_size = 0
+
+        for url, last_time in list(self._access_times.items()):
+            path = self._url_to_path(url) if url.startswith(("http://", "https://")) else url
+            if os.path.exists(path):
+                try:
+                    sz = os.path.getsize(path)
+                    cached.append((url, path, sz, last_time))
+                    total_size += sz
+                except OSError:
+                    pass
+            else:
+                self._access_times.pop(url, None)
+
+        # Sort by access time ascending (oldest first)
+        cached.sort(key=lambda item: item[3])
+
+        for url, path, sz, _ in cached:
+            file_limit_exceeded = (
+                self.max_cached_files is not None and len(cached) > self.max_cached_files
+            )
+            size_limit_exceeded = (
+                self.max_cache_bytes is not None and total_size > self.max_cache_bytes
+            )
+            if not (file_limit_exceeded or size_limit_exceeded):
+                break
+
+            if url in exclude_set or self._active_refs.get(url, 0) > 0:
+                continue
+
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                self._access_times.pop(url, None)
+                cached = [c for c in cached if c[0] != url]
+                total_size -= sz
+                logger.debug("Evicted cached remote file '%s' to respect forward cache limits.", path)
+            except OSError as e:
+                logger.warning("Could not evict cached file '%s': %s", path, e)
+
+    @property
+    def total_size_bytes(self) -> int:
+        """Total size in bytes of files currently cached on disk."""
+        with self._lock:
+            total = 0
+            for url in list(self._access_times.keys()):
+                path = self._url_to_path(url) if url.startswith(("http://", "https://")) else url
+                if os.path.exists(path):
+                    try:
+                        total += os.path.getsize(path)
+                    except OSError:
+                        pass
+            return total
+
+    @property
+    def total_size_gb(self) -> float:
+        """Total size in gigabytes of files currently cached on disk."""
+        return self.total_size_bytes / (1024 * 1024 * 1024)
+
+    @property
+    def cached_files_count(self) -> int:
+        """Number of files currently cached on disk."""
+        with self._lock:
+            count = 0
+            for url in list(self._access_times.keys()):
+                path = self._url_to_path(url) if url.startswith(("http://", "https://")) else url
+                if os.path.exists(path):
+                    count += 1
+            return count
+
+    def clear(self) -> None:
+        """Remove all files from the cache directory and reset state."""
+        with self._lock:
+            if self._prefetch_executor is not None:
+                self._prefetch_executor.shutdown(wait=False, cancel_futures=True)
+                self._prefetch_executor = None
+            self._prefetch_futures.clear()
+
+            if os.path.exists(self.cache_dir):
+                for f in os.listdir(self.cache_dir):
+                    if f.endswith((".parquet", ".pq", ".part", ".tmp")):
+                        try:
+                            os.remove(os.path.join(self.cache_dir, f))
+                        except OSError:
+                            pass
+            self._access_times.clear()
+            self._active_refs.clear()
+
+    def close(self) -> None:
+        """Stop background prefetch executor."""
+        with self._lock:
+            if self._prefetch_executor is not None:
+                self._prefetch_executor.shutdown(wait=False, cancel_futures=True)
+                self._prefetch_executor = None
+            self._prefetch_futures.clear()
+
+    def __getstate__(self) -> Dict[str, Any]:
+        state = self.__dict__.copy()
+        state.pop("_lock", None)
+        state.pop("_file_locks", None)
+        state.pop("_prefetch_executor", None)
+        state.pop("_prefetch_futures", None)
+        state.pop("_session", None)
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.RLock()
+        self._file_locks = {}
+        self._prefetch_executor = None
+        self._prefetch_futures = {}
+        self._session = None
 

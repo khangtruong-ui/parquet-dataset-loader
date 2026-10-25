@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.4.0] - 2026-10-25
 
 ### Added
+- **`FileCache` and Bounded Forward-Caching for Streaming Datasets**:
+  - Added `FileCache` class in `parquet_dataset_loader.cache` (and package export in `__all__`).
+  - Maintains a thread-safe, bounded on-disk LRU window of remote Parquet files regulated by file count (`max_cached_files`) or disk usage in GBs (`max_cache_gb` / `max_cache_bytes`).
+  - Eliminates Hugging Face HTTP `429 Too Many Requests` rate limiting and multi-worker socket exhaustion during streaming iterations.
+  - Features reference tracking (`acquire_file` / `release_file`) to ensure actively open files are never evicted mid-read.
+  - Automatically prefetches upcoming files forward in the sequence in a background daemon thread while foreground workers consume current batches.
+  - Added `get_row_group_file_indices()` and `get_file_urls()` to `IndexedParquetDataset`.
+  - Added `cache_files`, `max_cached_files`, and `max_cache_gb` parameters to `load_dataset(...)`.
 - **Bug-Free, High-Performance DataLoader API (`DataLoader` / `to_dataloader()`)**:
   - Introduced `DataLoader` class in `parquet_dataset_loader.dataloader` (and top-level package export).
   - Added `.to_dataloader()` and `.dataloader()` methods on both `IndexedParquetDataset` and `ParquetDatasetDict`.
@@ -37,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Updated `tests/test_benchmark.py` and `examples/custom_dataloader.py`.
 
 ### Fixed
+- **File-Preserving Block Shuffling & Rate Limit Resilience**:
+  - Updated `BlockShuffledSampler` to discover row group file indices and visit row groups file-by-file across permuted files, preventing multi-worker iterations from jumping randomly across dozens of remote files.
+  - Enhanced `RowGroupReader` and `download_single_file` with exponential backoff on HTTP 429 Too Many Requests, extended retry budgets, and Retry-After header awareness.
 - **Automatic Row-Group Locality in DataLoader Shuffling (`BlockShuffledSampler`)**:
   - `DataLoader(shuffle=True)` now automatically detects Parquet datasets and wrapped datasets providing row-group structures and selects `BlockShuffledSampler` by default rather than uniform random sampling.
   - Prevents multi-worker network thrashing, socket flooding, and timeout errors caused by concurrent worker threads evicting row-group caches and requesting random remote files over HTTP.
