@@ -11,7 +11,7 @@ from parquet_dataset_loader.api import (
     load_from_disk,
     resume_dataset,
 )
-from parquet_dataset_loader.cache import DiskCache, RowGroupMemoryCache
+from parquet_dataset_loader.cache import DiskCache, FileCache, RowGroupMemoryCache
 from parquet_dataset_loader.dataloader import (
     BatchSampler,
     DataLoader,
@@ -91,6 +91,7 @@ __all__ = [
     "RowGroupInfo",
     "RowGroupMemoryCache",
     "DiskCache",
+    "FileCache",
     "ProgressiveDiskSaver",
     "BackgroundDownloader",
     "RowGroupReader",

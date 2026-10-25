@@ -24,7 +24,7 @@ import pyarrow as pa
 import pyarrow.feather as feather
 import pyarrow.parquet as pq
 
-from parquet_dataset_loader.cache import DiskCache, RowGroupMemoryCache
+from parquet_dataset_loader.cache import DiskCache, FileCache, RowGroupMemoryCache
 from parquet_dataset_loader.dataset import IndexedParquetDataset, ParquetDatasetDict
 from parquet_dataset_loader.exceptions import (
     DatasetNotFoundError,
@@ -84,6 +84,9 @@ def load_dataset(
     from_index: Optional[int] = None,
     dataset_id: Optional[str] = None,
     manage: bool = True,
+    max_cached_files: Optional[int] = None,
+    max_cache_gb: Optional[float] = None,
+    cache_files: Optional[bool] = None,
     **kwargs: Any,
 ) -> Union[IndexedParquetDataset, ParquetDatasetDict]:
     """Load a Parquet dataset from Hugging Face Hub, local files, or remote URLs.
@@ -270,10 +273,28 @@ def load_dataset(
                 source_path=path if isinstance(path, str) else None,
             )
 
+        f_cache: Optional[FileCache] = None
+        has_remote = any(u.startswith(("http://", "https://")) for u in file_list)
+        should_cache_files = (
+            cache_files is True
+            or (cache_files is None and (max_cached_files is not None or max_cache_gb is not None))
+        )
+        if should_cache_files and has_remote:
+            file_cache_dir = os.path.join(resolved_cache_dir, "file_cache", safe_repo_name, s)
+            eff_max_files = max_cached_files if max_cached_files is not None else 4
+            f_cache = FileCache(
+                cache_dir=file_cache_dir,
+                max_cached_files=eff_max_files,
+                max_cache_gb=max_cache_gb,
+                token=token_for_children,
+            )
+            f_cache.set_file_sequence(file_list)
+
         reader = RowGroupReader(
             memory_cache=mem_cache,
             disk_cache=d_cache,
             progressive_saver=prog_saver,
+            file_cache=f_cache,
             token=token_for_children,
         )
 

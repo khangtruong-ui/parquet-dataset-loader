@@ -434,6 +434,29 @@ Authentication headers (`Authorization: Bearer <token>`) are automatically appli
 - Concurrent HTTP Range requests made by `fsspec` when streaming row groups.
 - Direct downloads and background prefetching workers.
 
+### 14. Forward File Caching & Bounded Disk Windows (`cache_files`, `max_cached_files`, `max_cache_gb`)
+
+When streaming large multi-file datasets (e.g. 62 GB across 62 files) with many workers, making continuous HTTP range requests directly over the network can result in socket flooding or Hugging Face HTTP `429 Too Many Requests` rate limiting.
+
+With forward file caching enabled, `parquet-dataset-loader` maintains a strictly bounded local sliding window of remote Parquet files on disk:
+- When a remote file is reached, it is downloaded locally and opened via memory mapping (`memory_map=True`), giving all worker threads zero-network, high-throughput access.
+- Upcoming files in the sequence are prefetched forward in the background while workers process current batches.
+- Once disk usage exceeds `max_cached_files` or `max_cache_gb`, older unreferenced files are automatically evicted and removed from disk.
+
+```python
+import parquet_dataset_loader as pdl
+
+# Forward-cache up to 4 remote Parquet files simultaneously on local disk (~4-6 GB window)
+ds = pdl.load_dataset(
+    "KhangTruong/COCO-inpainted",
+    split="train",
+    streaming=True,
+    cache_files=True,
+    max_cached_files=4,
+    max_cache_gb=6.0,
+)
+```
+
 ---
 
 ## High-Performance, Bug-Free DataLoader API (`pdl.DataLoader`)
@@ -704,6 +727,9 @@ pdl-kill --quiet
 | `start_index` / `from_index`| `int` / `None` | `None` | Starting row index for streaming. Background prefetch automatically prioritizes row groups starting from this index. |
 | `dataset_id` | `str` / `None` | `None` | Optional unique identifier to register dataset instance with `DatasetManager`. |
 | `manage` | `bool` | `True` | Whether to register instance with `DatasetManager` for global tracking and coordinated shutdown. |
+| `cache_files` | `bool` / `None` | `False` | When `True`, enables on-disk LRU file caching of remote Parquet files to eliminate HTTP socket thrashing and 429 rate limits. |
+| `max_cached_files` | `int` / `None` | `4` (if caching) | Maximum number of remote Parquet files forward-cached on local disk simultaneously. |
+| `max_cache_gb` | `float` / `None` | `None` | Maximum disk space in gigabytes allowed for cached Parquet files before evicting least recently used files. |
 
 ### `load_from_disk(...)`
 

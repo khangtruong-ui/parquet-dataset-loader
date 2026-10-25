@@ -103,6 +103,7 @@ class IndexedParquetDataset(collections.abc.Sequence):
             self._length = max_len if length is None else max(0, min(length, max_len))
 
         self.split = split or self.index.split_name
+        self.file_cache = getattr(reader, "file_cache", None)
 
         # Schema projection
         if self.columns is not None:
@@ -586,6 +587,36 @@ class IndexedParquetDataset(collections.abc.Sequence):
             rg_key = (rg_info.file_index, rg_info.rg_index)
             rg_map[rg_key].append(i)
         return list(rg_map.values())
+
+    def get_row_group_file_indices(self) -> List[int]:
+        """Return the file_index corresponding to each row group in get_row_group_indices()."""
+        if self._length == 0:
+            return []
+
+        if self.indices is None:
+            file_indices: List[int] = []
+            global_start = self.offset
+            global_stop = self.offset + self._length
+            ranges = self.index.locate_range(global_start, global_stop)
+            for rg_info, local_start, local_stop in ranges:
+                n_rows = local_stop - local_start
+                if n_rows > 0:
+                    file_indices.append(rg_info.file_index)
+            return file_indices
+
+        file_indices_shuffled: List[int] = []
+        seen_keys = set()
+        for global_idx in self.indices:
+            rg_info, _ = self.index.locate_row(global_idx)
+            rg_key = (rg_info.file_index, rg_info.rg_index)
+            if rg_key not in seen_keys:
+                seen_keys.add(rg_key)
+                file_indices_shuffled.append(rg_info.file_index)
+        return file_indices_shuffled
+
+    def get_file_urls(self) -> List[str]:
+        """Return list of distinct Parquet file URLs/paths in this dataset split."""
+        return [f.url for f in self.index.files]
 
     def to_arrow(self, batch_size: int = 1000) -> pa.Table:
         """Materialize this dataset view as an in-memory PyArrow Table.
@@ -1160,9 +1191,36 @@ class BlockShuffledSampler:
                     filtered_groups.append(valid_g)
             self.groups = filtered_groups
 
+        # Discover row group file indices to preserve file locality during multi-worker streaming
+        self.file_indices: Optional[List[int]] = None
+        for obj in (
+            dataset,
+            getattr(dataset, "pdl_dataset", None),
+            getattr(dataset, "parquet_dataset", None),
+            getattr(dataset, "dataset", None),
+        ):
+            if obj is not None and hasattr(obj, "get_row_group_file_indices"):
+                raw_f_indices = obj.get_row_group_file_indices()
+                if raw_f_indices and len(raw_f_indices) >= len(self.groups):
+                    self.file_indices = raw_f_indices[: len(self.groups)]
+                    break
+
     def set_epoch(self, epoch: int) -> None:
         """Set epoch index to vary shuffling permutation deterministically across epochs."""
         self.epoch = int(epoch)
+
+    def get_ordered_file_indices(self) -> List[int]:
+        """Return sequence of file indices visited in current epoch to guide forward prefetching."""
+        if self.file_indices is None or len(set(self.file_indices)) <= 1:
+            return []
+        from collections import defaultdict
+        file_to_groups: Dict[int, List[int]] = defaultdict(list)
+        for g_idx, f_idx in enumerate(self.file_indices):
+            file_to_groups[f_idx].append(g_idx)
+        file_order = list(file_to_groups.keys())
+        rng = random.Random(self.seed + self.epoch)
+        rng.shuffle(file_order)
+        return file_order
 
     def __iter__(self) -> Iterator[int]:
         if not self.shuffle:
@@ -1171,13 +1229,35 @@ class BlockShuffledSampler:
             return
 
         rng = random.Random(self.seed + self.epoch)
+
+        # File-preserving block shuffle: permute files across epochs and row-groups/samples within files
+        if self.file_indices is not None and len(set(self.file_indices)) > 1:
+            from collections import defaultdict
+            file_to_groups = defaultdict(list)
+            for g_idx, f_idx in enumerate(self.file_indices):
+                file_to_groups[f_idx].append(g_idx)
+
+            file_order = list(file_to_groups.keys())
+            rng.shuffle(file_order)
+
+            all_indices: List[int] = []
+            for f_idx in file_order:
+                rgs = list(file_to_groups[f_idx])
+                rng.shuffle(rgs)
+                for g_idx in rgs:
+                    chunk = list(self.groups[g_idx])
+                    rng.shuffle(chunk)
+                    all_indices.extend(chunk)
+            yield from all_indices
+            return
+
         group_order = list(range(len(self.groups)))
         rng.shuffle(group_order)
 
-        all_indices: List[int] = []
+        all_indices = []
         for i in range(0, len(group_order), self.window_blocks):
             window = group_order[i : i + self.window_blocks]
-            chunk: List[int] = []
+            chunk = []
             for g_idx in window:
                 chunk.extend(self.groups[g_idx])
             rng.shuffle(chunk)

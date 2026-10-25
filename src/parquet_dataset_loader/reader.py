@@ -20,7 +20,7 @@ import pyarrow.parquet as pq
 import requests
 from tqdm import tqdm
 
-from parquet_dataset_loader.cache import DiskCache, RowGroupMemoryCache
+from parquet_dataset_loader.cache import DiskCache, FileCache, RowGroupMemoryCache
 from parquet_dataset_loader.exceptions import CorruptParquetError, ParquetDatasetError
 from parquet_dataset_loader.hf_resolver import create_retry_session, resolve_hf_token
 
@@ -45,6 +45,7 @@ class RowGroupReader:
         memory_cache: Optional[RowGroupMemoryCache] = None,
         disk_cache: Optional[DiskCache] = None,
         progressive_saver: Optional[Any] = None,
+        file_cache: Optional[FileCache] = None,
         token: Optional[Union[bool, str]] = None,
         block_size: int = 2 * 1024 * 1024,  # 2 MB default block size
         max_open_files: int = 8,
@@ -57,6 +58,7 @@ class RowGroupReader:
         )
         self.disk_cache = disk_cache
         self.progressive_saver = progressive_saver
+        self.file_cache = file_cache
         self.token = resolve_hf_token(token)
         self.block_size = block_size
         self.max_open_files = max(1, max_open_files)
@@ -130,25 +132,44 @@ class RowGroupReader:
                 fp.close()
             except Exception:
                 pass
+            if self.file_cache is not None:
+                self.file_cache.release_file(file_url_or_path)
 
     def reset_filesystem(self) -> None:
         """Close current thread's open files and reset its HTTP filesystem connection pool."""
         if hasattr(self._local, "open_files") and self._local.open_files:
-            for _, (fp, _) in list(self._local.open_files.items()):
+            for url_or_path, (fp, _) in list(self._local.open_files.items()):
                 with self._lock:
                     self._all_active_fps.discard(fp)
                 try:
                     fp.close()
                 except Exception:
                     pass
+                if self.file_cache is not None:
+                    self.file_cache.release_file(url_or_path)
             self._local.open_files.clear()
         self._local.http_fs = None
         self._local.http_fs_pid = None
 
-    def _get_parquet_file(self, file_url_or_path: str, max_attempts: int = 3) -> pq.ParquetFile:
+    def _get_parquet_file(self, file_url_or_path: str, max_attempts: Optional[int] = None) -> pq.ParquetFile:
         """Obtain a reusable ParquetFile instance for current thread with retry on remote open."""
         is_remote = file_url_or_path.startswith(("http://", "https://"))
-        attempts = max_attempts if is_remote else 1
+
+        # Check local file cache if enabled
+        if is_remote and self.file_cache is not None:
+            try:
+                local_path = self.file_cache.get_or_download(file_url_or_path)
+                self.file_cache.acquire_file(file_url_or_path)
+                file_url_or_path = local_path
+                is_remote = False
+            except Exception as e:
+                logger.warning(
+                    "⚠️ FileCache could not retrieve '%s': %s. Streaming directly over HTTP.",
+                    file_url_or_path,
+                    e,
+                )
+
+        attempts = max_attempts if max_attempts is not None else (self.max_retries if is_remote else 1)
         last_exc: Optional[Exception] = None
 
         for attempt in range(attempts):
@@ -167,6 +188,8 @@ class RowGroupReader:
                     fp.close()
                 except Exception:
                     pass
+                if self.file_cache is not None and oldest_url:
+                    self.file_cache.release_file(oldest_url)
 
             fp = None
             try:
@@ -191,13 +214,20 @@ class RowGroupReader:
                         fp.close()
                     except Exception:
                         pass
-                if is_remote and attempt < attempts - 1 and "cannot schedule new futures" not in str(exc).lower():
+                is_rate_limit = "429" in str(exc) or "too many requests" in str(exc).lower()
+                effective_attempts = max(attempts, 6) if is_rate_limit else attempts
+                if is_remote and attempt < effective_attempts - 1 and "cannot schedule new futures" not in str(exc).lower():
+                    delay = (
+                        min(self.max_retry_delay * 4, 3.0 * (2 ** attempt))
+                        if is_rate_limit
+                        else min(self.max_retry_delay, self.retry_delay * (2 ** attempt))
+                    )
                     logger.warning(
-                        f"⚠️ Error opening remote ParquetFile '{file_url_or_path}' "
-                        f"(attempt {attempt + 1}/{attempts}): {exc}. Resetting filesystem and retrying..."
+                        f"⚠️ {'Rate limit (429)' if is_rate_limit else 'Error'} opening remote ParquetFile '{file_url_or_path}' "
+                        f"(attempt {attempt + 1}/{effective_attempts}): {exc}. Resetting filesystem and retrying in {delay:.2f}s..."
                     )
                     self.reset_filesystem()
-                    time.sleep(min(self.max_retry_delay, self.retry_delay * (2 ** attempt)))
+                    time.sleep(delay)
                 else:
                     break
 
@@ -263,11 +293,17 @@ class RowGroupReader:
                 last_error = e
                 # Evict the potentially severed/corrupted file handle from pool
                 self._evict_file(file_url)
-                if is_remote and attempt < max_attempts - 1 and "cannot schedule new futures" not in str(e).lower():
-                    delay = min(self.max_retry_delay, self.retry_delay * (2 ** attempt))
+                is_rate_limit = "429" in str(e) or "too many requests" in str(e).lower()
+                effective_attempts = max(max_attempts, 6) if is_rate_limit else max_attempts
+                if is_remote and attempt < effective_attempts - 1 and "cannot schedule new futures" not in str(e).lower():
+                    delay = (
+                        min(self.max_retry_delay * 4, 3.0 * (2 ** attempt))
+                        if is_rate_limit
+                        else min(self.max_retry_delay, self.retry_delay * (2 ** attempt))
+                    )
                     logger.warning(
-                        f"⚠️ Transient error reading row group {rg_index} from '{file_url}' "
-                        f"(attempt {attempt + 1}/{max_attempts}): {e}. "
+                        f"⚠️ {'Rate limit (429)' if is_rate_limit else 'Transient error'} reading row group {rg_index} from '{file_url}' "
+                        f"(attempt {attempt + 1}/{effective_attempts}): {e}. "
                         f"Resetting connection and retrying in {delay:.2f}s..."
                     )
                     # For payload/network stream errors, reset filesystem to establish fresh HTTP session
@@ -308,6 +344,8 @@ class RowGroupReader:
                     pass
             self._all_active_fps.clear()
         self.memory_cache.clear()
+        if self.file_cache is not None:
+            self.file_cache.close()
 
     def __getstate__(self) -> Dict[str, Any]:
         state = self.__dict__.copy()
@@ -330,18 +368,23 @@ class RowGroupReader:
 def download_single_file(
     url: str,
     target_path: str,
-    session: requests.Session,
+    session: Optional[requests.Session] = None,
     token: Optional[Union[bool, str]] = None,
     chunk_size: int = 1024 * 1024,
+    max_retries: int = 5,
 ) -> str:
     """Download a single remote Parquet file with resume and atomic write.
+
+    Handles transient network errors, socket disconnects, and HTTP 429 rate limits
+    with exponential backoff and Retry-After awareness.
 
     Args:
         url: File URL to download.
         target_path: Destination path on local disk.
-        session: requests.Session.
+        session: Optional requests.Session.
         token: Optional auth token.
         chunk_size: Streaming chunk size in bytes.
+        max_retries: Number of retry attempts.
 
     Returns:
         The target path.
@@ -349,14 +392,30 @@ def download_single_file(
     os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
     temp_path = f"{target_path}.part"
 
+    sess = session or create_retry_session()
     auth_token = resolve_hf_token(token)
     headers = {}
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
 
-    # Check remote size
-    head = session.head(url, headers=headers, allow_redirects=True, timeout=15)
-    remote_size = int(head.headers.get("content-length", 0))
+    # Check remote size with retry on 429
+    remote_size = 0
+    for attempt in range(max_retries):
+        try:
+            head = sess.head(url, headers=headers, allow_redirects=True, timeout=15)
+            if head.status_code == 429:
+                retry_after = head.headers.get("Retry-After")
+                delay = float(retry_after) if retry_after and retry_after.isdigit() else min(30.0, 2.0 * (2 ** attempt))
+                logger.warning("⚠️ 429 Too Many Requests on HEAD %s (attempt %d/%d). Sleeping %0.1fs...", url, attempt + 1, max_retries, delay)
+                time.sleep(delay)
+                continue
+            head.raise_for_status()
+            remote_size = int(head.headers.get("content-length", 0))
+            break
+        except requests.RequestException as e:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(min(30.0, 1.5 * (2 ** attempt)))
 
     if os.path.exists(target_path) and remote_size > 0:
         if os.path.getsize(target_path) == remote_size:
@@ -372,12 +431,25 @@ def download_single_file(
         else:
             resume_offset = 0
 
-    with session.get(url, headers=headers, stream=True, timeout=30) as resp:
-        resp.raise_for_status()
-        with open(temp_path, mode) as f:
-            for chunk in resp.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    f.write(chunk)
+    for attempt in range(max_retries):
+        try:
+            with sess.get(url, headers=headers, stream=True, timeout=30) as resp:
+                if resp.status_code == 429:
+                    retry_after = resp.headers.get("Retry-After")
+                    delay = float(retry_after) if retry_after and retry_after.isdigit() else min(30.0, 2.0 * (2 ** attempt))
+                    logger.warning("⚠️ 429 Too Many Requests on GET %s (attempt %d/%d). Sleeping %0.1fs...", url, attempt + 1, max_retries, delay)
+                    time.sleep(delay)
+                    continue
+                resp.raise_for_status()
+                with open(temp_path, mode) as f:
+                    for chunk in resp.iter_content(chunk_size=chunk_size):
+                        if chunk:
+                            f.write(chunk)
+            break
+        except requests.RequestException as e:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(min(30.0, 1.5 * (2 ** attempt)))
 
     os.replace(temp_path, target_path)
     return target_path
