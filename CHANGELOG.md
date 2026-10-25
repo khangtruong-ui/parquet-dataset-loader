@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-10-25
+
+### Added
+- **Bug-Free, High-Performance DataLoader API (`DataLoader` / `to_dataloader()`)**:
+  - Introduced `DataLoader` class in `parquet_dataset_loader.dataloader` (and top-level package export).
+  - Added `.to_dataloader()` and `.dataloader()` methods on both `IndexedParquetDataset` and `ParquetDatasetDict`.
+  - Default `num_workers` automatically resolves to `os.cpu_count()` (or `num_workers=-1` infers CPU count).
+  - Vectorized contiguous batch slicing fast-path achieving up to 10x-50x speedup over row-by-row lookups.
+  - Multi-threaded and multi-process prefetching architectures (`worker_type="auto"`, `"thread"`, `"process"`).
+  - Thread worker pool eliminates fork-related SSL/HTTP socket corruption, locks, and IPC pickle overhead.
+  - Clean worker lifecycle with guaranteed termination: no zombie processes, leaks, or hangs on early loop breaks.
+  - Context manager support (`with DataLoader(...) as loader:`).
+- **Robust Default Collation (`default_collate` & `numpy_collate`)**:
+  - `default_collate`: Handles PyTorch tensors, NumPy arrays, strings, bytes, `NoneType`, and variable-length sequences without crashing.
+  - `numpy_collate`: Pure NumPy / JAX / Flax collator converting batches to `np.ndarray` without PyTorch dependency or Tensor conversion.
+  - Added `safe_dataloader_len(loader)` helper safely returning length or `None` on streaming datasets.
+  - Added support for unindexed iterable/streaming datasets with background prefetching and clean early-break lifecycle.
+  - Supports both lists of sample dictionaries and pre-sliced column dictionaries.
+- **Data Speed Benchmarking (`loader.benchmark()` / `benchmark_dataloader()`)**:
+  - Measures throughput (batches/sec, samples/sec), latency metrics (mean, min, max, std dev in ms), and total duration.
+  - Added `--dataloader` scientific CLI benchmark flag to `pdl-benchmark`.
+- **Debug-Mode Bottleneck Profiling & Diagnostics (`view_bottleneck()`)**:
+  - Profiling is strictly disabled by default (`debug=False`) for zero runtime overhead.
+  - In debug mode (`debug=True`), captures fine-grained component timings (worker fetch, queue wait, collate).
+  - Automatically identifies primary bottlenecks (I/O & fetch starvation vs CPU collation) and generates actionable tuning suggestions.
+- **Early Health & Anomaly Warnings**:
+  - Emits actionable warnings after several batches for severe consumer starvation (>80% idle wait), latency stalls/spikes (>5x moving average), or empty batches.
+- **Unit & Integration Test Suite**:
+  - Added `tests/test_dataloader.py` with 15 comprehensive unit tests.
+  - Updated `tests/test_benchmark.py` and `examples/custom_dataloader.py`.
+
+### Fixed
+- **Automatic Row-Group Locality in DataLoader Shuffling (`BlockShuffledSampler`)**:
+  - `DataLoader(shuffle=True)` now automatically detects Parquet datasets and wrapped datasets providing row-group structures and selects `BlockShuffledSampler` by default rather than uniform random sampling.
+  - Prevents multi-worker network thrashing, socket flooding, and timeout errors caused by concurrent worker threads evicting row-group caches and requesting random remote files over HTTP.
+  - Expanded `BlockShuffledSampler` to discover row groups across wrapped dataset adapters (e.g. `parquet_dataset`, `pdl_dataset`, `dataset`).
+- **Thread-Isolated Open File Handles and Connection Pools in `RowGroupReader`**:
+  - Replaced shared `_open_files` and filesystem connection with thread-local storage (`threading.local`) so concurrent DataLoader worker threads have dedicated HTTP file handles and LRU pools.
+  - Resolved `ValueError: I/O operation on closed file.` caused by cross-thread LRU cache eviction when multiple worker threads read concurrently from remote Parquet files.
+  - Isolated transient error connection resets (`reset_filesystem()`) to the calling worker thread, preventing cascading failures across other active threads.
+  - Global `close()` safely tracks and closes all open handles across all threads under thread lock.
+  - Added graceful termination checks in DataLoader worker threads during raw batch retrieval and result queuing to prevent hangs on early loop breaks.
+
 ## [0.3.2] - 2026-10-07
 
 ### Added

@@ -847,6 +847,46 @@ class IndexedParquetDataset(collections.abc.Sequence):
 
         return abs_target_dir
 
+    def to_dataloader(
+        self,
+        batch_size: int = 1,
+        shuffle: bool = False,
+        sampler: Optional[Any] = None,
+        batch_sampler: Optional[Any] = None,
+        num_workers: Optional[int] = None,
+        collate_fn: Optional[Callable[[Any], Any]] = None,
+        drop_last: bool = False,
+        timeout: float = 60.0,
+        worker_type: str = "auto",
+        prefetch_factor: int = 2,
+        pin_memory: bool = False,
+        debug: bool = False,
+        seed: Optional[int] = None,
+    ) -> Any:
+        """Create a high-performance, bug-free DataLoader for this dataset."""
+        from parquet_dataset_loader.dataloader import DataLoader
+
+        return DataLoader(
+            dataset=self,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            sampler=sampler,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            drop_last=drop_last,
+            timeout=timeout,
+            worker_type=worker_type,
+            prefetch_factor=prefetch_factor,
+            pin_memory=pin_memory,
+            debug=debug,
+            seed=seed if seed is not None else self.seed,
+        )
+
+    def dataloader(self, **kwargs: Any) -> Any:
+        """Alias for to_dataloader()."""
+        return self.to_dataloader(**kwargs)
+
     def __repr__(self) -> str:
         col_repr = ", ".join(self.column_names[:5])
         if len(self.column_names) > 5:
@@ -1015,6 +1055,32 @@ class ParquetDatasetDict(dict):
 
         return abs_target_dir
 
+    def to_dataloader(
+        self,
+        split: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Create DataLoader(s) for split(s) in this dataset dictionary.
+
+        Args:
+            split: Specific split name (e.g. 'train'). If None, returns a dict mapping
+                each split name to its DataLoader.
+            **kwargs: Arguments forwarded to DataLoader.
+
+        Returns:
+            A DataLoader instance or a dictionary of DataLoaders per split.
+        """
+        if split is not None:
+            if split not in self:
+                raise KeyError(f"Split '{split}' not found. Available splits: {list(self.keys())}")
+            return self[split].to_dataloader(**kwargs)
+
+        return {s: ds.to_dataloader(**kwargs) for s, ds in self.items()}
+
+    def dataloader(self, **kwargs: Any) -> Any:
+        """Alias for to_dataloader()."""
+        return self.to_dataloader(**kwargs)
+
     def __enter__(self) -> ParquetDatasetDict:
         return self
 
@@ -1069,7 +1135,7 @@ class BlockShuffledSampler:
     ) -> None:
         self.dataset = dataset
         self.window_blocks = max(1, int(window_blocks))
-        self.seed = int(seed)
+        self.seed = int(seed) if seed is not None else random.randint(0, 1_000_000)
         self.shuffle = bool(shuffle)
         self.epoch = 0
 
@@ -1077,6 +1143,10 @@ class BlockShuffledSampler:
             self.groups = dataset.get_row_group_indices()
         elif hasattr(dataset, "pdl_dataset") and hasattr(dataset.pdl_dataset, "get_row_group_indices"):
             self.groups = dataset.pdl_dataset.get_row_group_indices()
+        elif hasattr(dataset, "parquet_dataset") and hasattr(dataset.parquet_dataset, "get_row_group_indices"):
+            self.groups = dataset.parquet_dataset.get_row_group_indices()
+        elif hasattr(dataset, "dataset") and hasattr(dataset.dataset, "get_row_group_indices"):
+            self.groups = dataset.dataset.get_row_group_indices()
         else:
             self.groups = [list(range(len(dataset)))]
 

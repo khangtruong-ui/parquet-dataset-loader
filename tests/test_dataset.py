@@ -228,6 +228,9 @@ def test_dataset_pytorch_multi_worker_dataloader(sample_dataset: IndexedParquetD
     except ImportError:
         pytest.skip("PyTorch not installed")
 
+    if getattr(torch, "tpu", None) is not None:
+        pytest.skip("PyTorch multi-worker DataLoader fork is unsupported in single-client TPU runtime")
+
     loader = DataLoader(sample_dataset, batch_size=10, num_workers=2, shuffle=False)
     batches = list(loader)
     assert len(batches) == 10

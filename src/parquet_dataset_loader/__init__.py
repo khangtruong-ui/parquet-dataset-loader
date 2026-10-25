@@ -11,6 +11,17 @@ from parquet_dataset_loader.api import (
     load_from_disk,
     resume_dataset,
 )
+from parquet_dataset_loader.cache import DiskCache, RowGroupMemoryCache
+from parquet_dataset_loader.dataloader import (
+    BatchSampler,
+    DataLoader,
+    RandomSampler,
+    SequentialSampler,
+    benchmark_dataloader,
+    default_collate,
+    numpy_collate,
+    safe_dataloader_len,
+)
 from parquet_dataset_loader.dataset import (
     BlockShuffledSampler,
     IndexedParquetDataset,
@@ -49,7 +60,7 @@ from parquet_dataset_loader.manager import (
 from parquet_dataset_loader.progressive import BackgroundDownloader, ProgressiveDiskSaver
 from parquet_dataset_loader.reader import RowGroupReader, download_parquet_files
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 __all__ = [
     "__version__",
     "DEFAULT_CACHE_DIR",
@@ -60,6 +71,14 @@ __all__ = [
     "BlockShuffledSampler",
     "IndexedParquetDataset",
     "ParquetDatasetDict",
+    "DataLoader",
+    "BatchSampler",
+    "SequentialSampler",
+    "RandomSampler",
+    "default_collate",
+    "numpy_collate",
+    "safe_dataloader_len",
+    "benchmark_dataloader",
     "DatasetManager",
     "get_dataset_manager",
     "list_active_datasets",
