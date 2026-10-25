@@ -356,3 +356,89 @@ def test_dataloader_context_manager(sample_indexed_dataset: IndexedParquetDatase
     assert loader._is_closed is True
     with pytest.raises(RuntimeError, match="Cannot iterate over a closed DataLoader"):
         list(loader)
+
+
+def test_numpy_collate() -> None:
+    """Verify numpy_collate produces pure NumPy arrays without PyTorch Tensors."""
+    from parquet_dataset_loader.dataloader import numpy_collate
+    import numpy as np
+    import torch
+
+    # Dict of numpy arrays
+    batch = [
+        {"img": np.ones((4, 4), dtype=np.float32), "lbl": 1, "text": "cat"},
+        {"img": np.zeros((4, 4), dtype=np.float32), "lbl": 2, "text": "dog"},
+    ]
+    collated = numpy_collate(batch)
+    assert isinstance(collated["img"], np.ndarray)
+    assert collated["img"].shape == (2, 4, 4)
+    assert not isinstance(collated["img"], torch.Tensor)
+    assert isinstance(collated["lbl"], np.ndarray)
+    assert collated["lbl"].tolist() == [1, 2]
+    assert collated["text"] == ["cat", "dog"]
+
+    # PyTorch Tensors converted to NumPy ndarrays
+    batch_torch = [
+        {"x": torch.tensor([1.0, 2.0])},
+        {"x": torch.tensor([3.0, 4.0])},
+    ]
+    collated_torch = numpy_collate(batch_torch)
+    assert isinstance(collated_torch["x"], np.ndarray)
+    assert not isinstance(collated_torch["x"], torch.Tensor)
+    np.testing.assert_array_equal(collated_torch["x"], np.array([[1.0, 2.0], [3.0, 4.0]]))
+
+
+def test_dataloader_with_numpy_collate(sample_indexed_dataset: IndexedParquetDataset) -> None:
+    """Verify DataLoader with collate_fn='numpy' returns pure NumPy batches."""
+    import numpy as np
+    import torch
+
+    ds = sample_indexed_dataset
+    loader = DataLoader(ds, batch_size=10, collate_fn="numpy", num_workers=2)
+    b0 = next(iter(loader))
+    assert isinstance(b0["id"], np.ndarray)
+    assert not isinstance(b0["id"], torch.Tensor)
+    assert b0["id"].shape == (10,)
+    assert b0["text"] == [f"sample_text_{i}" for i in range(10)]
+
+
+def test_dataloader_iterable_streaming_dataset() -> None:
+    """Verify DataLoader supports unindexed streaming Iterable datasets."""
+    from parquet_dataset_loader.dataloader import safe_dataloader_len
+    import numpy as np
+
+    class SimpleStreamDataset:
+        def __init__(self, count: int = 15):
+            self.count = count
+
+        def __iter__(self):
+            for i in range(self.count):
+                yield {"val": np.array([i], dtype=np.int32)}
+
+    stream_ds = SimpleStreamDataset(count=10)
+
+    # 1. Length checks
+    loader_sync = DataLoader(stream_ds, batch_size=3, num_workers=0, collate_fn="numpy")
+    with pytest.raises(TypeError, match="has no static len"):
+        _ = len(loader_sync)
+    assert safe_dataloader_len(loader_sync) is None
+
+    # 2. Synchronous iteration
+    batches_sync = list(loader_sync)
+    assert len(batches_sync) == 4  # 3 batches of 3, 1 batch of 1
+    assert batches_sync[0]["val"].shape == (3, 1)
+    assert batches_sync[-1]["val"].shape == (1, 1)
+
+    # 3. Multi-worker / background prefetching iteration
+    loader_async = DataLoader(stream_ds, batch_size=4, num_workers=2, collate_fn="numpy")
+    batches_async = list(loader_async)
+    assert len(batches_async) == 3  # 4, 4, 2
+    assert batches_async[0]["val"].shape == (4, 1)
+    assert batches_async[-1]["val"].shape == (2, 1)
+
+    # 4. Early break terminates cleanly without hanging
+    early_loader = DataLoader(stream_ds, batch_size=2, num_workers=2, collate_fn="numpy")
+    for i, b in enumerate(early_loader):
+        if i == 1:
+            break
+

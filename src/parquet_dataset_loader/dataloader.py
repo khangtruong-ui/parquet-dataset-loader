@@ -253,6 +253,78 @@ def default_collate(batch: Any) -> Any:
     return list(batch)
 
 
+def numpy_collate(batch: Any) -> Any:
+    """Robust, bug-free collator for NumPy, JAX, and Flax workloads.
+
+    Recursively collates lists and mappings of arrays, numbers, and strings into
+    NumPy ndarrays without PyTorch dependency or Tensor conversion. If PyTorch Tensors
+    are encountered, they are converted cleanly to NumPy ndarrays via `.detach().cpu().numpy()`.
+    """
+    if not batch:
+        return batch
+
+    # Case 1: Batch is already a mapping of lists/arrays (e.g., from pre-sliced fast path)
+    if isinstance(batch, collections.abc.Mapping):
+        return {k: numpy_collate(v) for k, v in batch.items()}
+
+    elem = batch[0]
+
+    # Case 2: Batch is a list of dictionaries -> gather keys and recurse
+    if isinstance(elem, collections.abc.Mapping):
+        keys = elem.keys()
+        return {k: numpy_collate([d[k] for d in batch if k in d]) for k in keys}
+
+    # Case 3: Strings, binary bytes, or None -> keep as native Python list
+    if isinstance(elem, (str, bytes)) or elem is None:
+        return list(batch)
+
+    # Case 4: PyTorch Tensors -> convert to NumPy ndarray
+    if _HAS_TORCH and isinstance(elem, torch.Tensor):
+        try:
+            return np.stack([x.detach().cpu().numpy() for x in batch], axis=0)
+        except Exception:
+            return list(batch)
+
+    # Case 5: NumPy arrays
+    if _HAS_NUMPY and isinstance(elem, np.ndarray):
+        try:
+            return np.stack(batch, axis=0)
+        except Exception:
+            return list(batch)
+
+    # Case 6: Numbers and booleans
+    if isinstance(elem, (int, float, bool)) or (_HAS_NUMPY and isinstance(elem, np.number)):
+        if _HAS_NUMPY:
+            try:
+                return np.array(batch)
+            except Exception:
+                return list(batch)
+        return list(batch)
+
+    # Case 7: Sequences (list, tuple) -> check for equal lengths
+    if isinstance(elem, (list, tuple)):
+        if all(isinstance(x, (list, tuple)) and len(x) == len(elem) for x in batch):
+            try:
+                transposed = zip(*batch)
+                return [numpy_collate(samples) for samples in transposed]
+            except Exception:
+                return list(batch)
+        return list(batch)
+
+    # Fallback: preserve list
+    return list(batch)
+
+
+def safe_dataloader_len(loader: Optional[Any]) -> Optional[int]:
+    """Safely return DataLoader length, or None if dataset has no length (e.g. streaming)."""
+    if loader is None:
+        return None
+    try:
+        return len(loader)
+    except (TypeError, NotImplementedError):
+        return None
+
+
 def pin_memory_batch(batch: Any) -> Any:
     """Recursively pins tensors in host memory for faster CUDA transfer."""
     if _HAS_TORCH:
@@ -490,7 +562,17 @@ class DataLoader:
         self.worker_type = "thread" if worker_type == "auto" else worker_type
 
         # Collate function
-        self.collate_fn = collate_fn if collate_fn is not None else default_collate
+        if collate_fn is None or collate_fn == "default":
+            self.collate_fn = default_collate
+        elif collate_fn == "numpy":
+            self.collate_fn = numpy_collate
+        elif callable(collate_fn):
+            self.collate_fn = collate_fn
+        else:
+            raise ValueError(f"Unknown collate_fn: {collate_fn}")
+
+        # Determine dataset indexing mode
+        self._is_map = hasattr(self.dataset, "__getitem__") and hasattr(self.dataset, "__len__")
 
         # Sampler setup
         if batch_sampler is not None:
@@ -505,13 +587,23 @@ class DataLoader:
             self.sampler = sampler
             self.batch_sampler = BatchSampler(self.sampler, self.batch_size, self.drop_last)
             self.shuffle = False
-        else:
+        elif self._is_map:
             self.shuffle = bool(shuffle)
             if self.shuffle:
                 self.sampler = RandomSampler(self.dataset, seed=self.seed)
             else:
                 self.sampler = SequentialSampler(self.dataset)
             self.batch_sampler = BatchSampler(self.sampler, self.batch_size, self.drop_last)
+        else:
+            if shuffle:
+                warnings.warn(
+                    "DataLoader: Shuffling is not directly supported for unindexed streaming/iterable datasets without a shuffle buffer. Set shuffle=False or pre-shuffle the stream.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            self.sampler = None
+            self.batch_sampler = None
+            self.shuffle = False
 
         # Profiling and health monitoring records
         self._profile_records: List[BatchProfileRecord] = []
@@ -519,7 +611,18 @@ class DataLoader:
         self._is_closed = False
 
     def __len__(self) -> int:
-        return len(self.batch_sampler)
+        if self.batch_sampler is not None:
+            return len(self.batch_sampler)
+        if hasattr(self.dataset, "__len__"):
+            try:
+                total = len(self.dataset)
+                if total is not None:
+                    if self.drop_last:
+                        return total // self.batch_size
+                    return (total + self.batch_size - 1) // self.batch_size
+            except (TypeError, NotImplementedError):
+                pass
+        raise TypeError(f"'{type(self).__name__}' object has no static len() for streaming dataset")
 
     def set_epoch(self, epoch: int) -> None:
         """Set epoch for samplers that support deterministic shuffling across epochs."""
@@ -652,54 +755,219 @@ class DataLoader:
         """Synchronous main-thread execution with 0 worker overhead."""
         recent_step_times: List[float] = []
 
-        for batch_idx, indices in enumerate(self.batch_sampler):
-            t_start = time.perf_counter()
+        if self._is_map:
+            for batch_idx, indices in enumerate(self.batch_sampler):
+                t_start = time.perf_counter()
 
-            # 1. Fetch raw batch
-            t0 = time.perf_counter()
-            raw_batch = self._fetch_raw_batch(self.dataset, indices)
-            t1 = time.perf_counter()
-            fetch_time = t1 - t0
+                # 1. Fetch raw batch
+                t0 = time.perf_counter()
+                raw_batch = self._fetch_raw_batch(self.dataset, indices)
+                t1 = time.perf_counter()
+                fetch_time = t1 - t0
 
-            # 2. Collate
-            t2 = time.perf_counter()
-            batch = self.collate_fn(raw_batch)
-            t3 = time.perf_counter()
-            collate_time = t3 - t2
+                # 2. Collate
+                t2 = time.perf_counter()
+                batch = self.collate_fn(raw_batch)
+                t3 = time.perf_counter()
+                collate_time = t3 - t2
 
-            if self.pin_memory:
-                batch = pin_memory_batch(batch)
+                if self.pin_memory:
+                    batch = pin_memory_batch(batch)
 
-            t_end = time.perf_counter()
-            step_time = t_end - t_start
+                t_end = time.perf_counter()
+                step_time = t_end - t_start
 
-            # Diagnostics and warnings
-            self._check_health_and_warn(
-                batch_idx=batch_idx,
-                batch=batch,
-                step_time=step_time,
-                queue_wait_time=0.0,
-                recent_step_times=recent_step_times,
-            )
-            recent_step_times.append(step_time)
-
-            if self.debug:
-                num_samples = len(indices)
-                self._profile_records.append(
-                    BatchProfileRecord(
-                        batch_idx=batch_idx,
-                        fetch_time=fetch_time,
-                        collate_time=collate_time,
-                        queue_wait_time=0.0,
-                        step_time=step_time,
-                        num_samples=num_samples,
-                    )
+                # Diagnostics and warnings
+                self._check_health_and_warn(
+                    batch_idx=batch_idx,
+                    batch=batch,
+                    step_time=step_time,
+                    queue_wait_time=0.0,
+                    recent_step_times=recent_step_times,
                 )
+                recent_step_times.append(step_time)
 
-            yield batch
+                if self.debug:
+                    num_samples = len(indices)
+                    self._profile_records.append(
+                        BatchProfileRecord(
+                            batch_idx=batch_idx,
+                            fetch_time=fetch_time,
+                            collate_time=collate_time,
+                            queue_wait_time=0.0,
+                            step_time=step_time,
+                            num_samples=num_samples,
+                        )
+                    )
+
+                yield batch
+        else:
+            batch_idx = 0
+            cur_batch: List[Any] = []
+            for item in self.dataset:
+                cur_batch.append(item)
+                if len(cur_batch) == self.batch_size:
+                    t_start = time.perf_counter()
+                    t0 = time.perf_counter()
+                    batch = self.collate_fn(cur_batch)
+                    t1 = time.perf_counter()
+                    if self.pin_memory:
+                        batch = pin_memory_batch(batch)
+                    step_time = time.perf_counter() - t_start
+                    self._check_health_and_warn(
+                        batch_idx=batch_idx,
+                        batch=batch,
+                        step_time=step_time,
+                        queue_wait_time=0.0,
+                        recent_step_times=recent_step_times,
+                    )
+                    recent_step_times.append(step_time)
+                    if self.debug:
+                        self._profile_records.append(
+                            BatchProfileRecord(
+                                batch_idx=batch_idx,
+                                fetch_time=0.0,
+                                collate_time=t1 - t0,
+                                queue_wait_time=0.0,
+                                step_time=step_time,
+                                num_samples=len(cur_batch),
+                            )
+                        )
+                    batch_idx += 1
+                    cur_batch = []
+                    yield batch
+            if cur_batch and not self.drop_last:
+                t_start = time.perf_counter()
+                t0 = time.perf_counter()
+                batch = self.collate_fn(cur_batch)
+                t1 = time.perf_counter()
+                if self.pin_memory:
+                    batch = pin_memory_batch(batch)
+                step_time = time.perf_counter() - t_start
+                self._check_health_and_warn(
+                    batch_idx=batch_idx,
+                    batch=batch,
+                    step_time=step_time,
+                    queue_wait_time=0.0,
+                    recent_step_times=recent_step_times,
+                )
+                recent_step_times.append(step_time)
+                yield batch
+
+    def _iter_streaming_multi_worker(self) -> Iterator[Any]:
+        """Streaming background prefetching for unindexed Iterable datasets."""
+        queue_capacity = max(2, self.num_workers * self.prefetch_factor)
+        q: queue.Queue = queue.Queue(maxsize=queue_capacity)
+        shutdown_event = threading.Event()
+        sentinel = object()
+        recent_step_times: List[float] = []
+
+        def producer() -> None:
+            batch_idx = 0
+            cur_batch: List[Any] = []
+            try:
+                for item in self.dataset:
+                    if shutdown_event.is_set():
+                        break
+                    cur_batch.append(item)
+                    if len(cur_batch) == self.batch_size:
+                        t0 = time.perf_counter()
+                        collated = self.collate_fn(cur_batch)
+                        t1 = time.perf_counter()
+                        if self.pin_memory:
+                            collated = pin_memory_batch(collated)
+                        timings = {"fetch_time": 0.0, "collate_time": t1 - t0, "num_samples": float(len(cur_batch))}
+                        while not shutdown_event.is_set():
+                            try:
+                                q.put((batch_idx, collated, timings), timeout=0.2)
+                                break
+                            except queue.Full:
+                                continue
+                        batch_idx += 1
+                        cur_batch = []
+                if cur_batch and not self.drop_last and not shutdown_event.is_set():
+                    t0 = time.perf_counter()
+                    collated = self.collate_fn(cur_batch)
+                    t1 = time.perf_counter()
+                    if self.pin_memory:
+                        collated = pin_memory_batch(collated)
+                    timings = {"fetch_time": 0.0, "collate_time": t1 - t0, "num_samples": float(len(cur_batch))}
+                    while not shutdown_event.is_set():
+                        try:
+                            q.put((batch_idx, collated, timings), timeout=0.2)
+                            break
+                        except queue.Full:
+                            continue
+            except BaseException as exc:
+                tb = traceback.format_exc()
+                try:
+                    q.put((batch_idx, _WorkerExceptionWrapper(exc, tb), {}), timeout=1.0)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    q.put(sentinel, timeout=1.0)
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=producer, daemon=True, name="pdl-dataloader-stream-producer")
+        t.start()
+
+        try:
+            batch_count = 0
+            while not shutdown_event.is_set():
+                t_start = time.perf_counter()
+                try:
+                    item = q.get(timeout=self.timeout)
+                except queue.Empty:
+                    raise TimeoutError(f"DataLoader timed out waiting for streaming batch after {self.timeout:.1f}s.")
+
+                if item is sentinel:
+                    break
+
+                b_idx, batch_data, timings = item
+                if isinstance(batch_data, _WorkerExceptionWrapper):
+                    raise RuntimeError(f"Exception in streaming DataLoader worker:\n{batch_data.tb_str}") from batch_data.exc
+
+                step_time = time.perf_counter() - t_start
+                self._check_health_and_warn(
+                    batch_idx=batch_count,
+                    batch=batch_data,
+                    step_time=step_time,
+                    queue_wait_time=step_time,
+                    recent_step_times=recent_step_times,
+                )
+                recent_step_times.append(step_time)
+
+                if self.debug:
+                    self._profile_records.append(
+                        BatchProfileRecord(
+                            batch_idx=batch_count,
+                            fetch_time=timings.get("fetch_time", 0.0),
+                            collate_time=timings.get("collate_time", 0.0),
+                            queue_wait_time=step_time,
+                            step_time=step_time,
+                            num_samples=int(timings.get("num_samples", 0)),
+                        )
+                    )
+
+                batch_count += 1
+                yield batch_data
+        finally:
+            shutdown_event.set()
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+            t.join(timeout=1.0)
 
     def _iter_multi_worker(self) -> Iterator[Any]:
         """Multi-worker prefetching with bounded queue and guaranteed clean exit."""
+        if not self._is_map:
+            yield from self._iter_streaming_multi_worker()
+            return
+
         num_workers = self.num_workers
         queue_capacity = max(2, num_workers * self.prefetch_factor)
 

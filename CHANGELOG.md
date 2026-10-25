@@ -17,8 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Thread worker pool eliminates fork-related SSL/HTTP socket corruption, locks, and IPC pickle overhead.
   - Clean worker lifecycle with guaranteed termination: no zombie processes, leaks, or hangs on early loop breaks.
   - Context manager support (`with DataLoader(...) as loader:`).
-- **Robust Default Collation (`default_collate`)**:
-  - Handles PyTorch tensors, NumPy arrays, strings, bytes, `NoneType`, and variable-length sequences without crashing.
+- **Robust Default Collation (`default_collate` & `numpy_collate`)**:
+  - `default_collate`: Handles PyTorch tensors, NumPy arrays, strings, bytes, `NoneType`, and variable-length sequences without crashing.
+  - `numpy_collate`: Pure NumPy / JAX / Flax collator converting batches to `np.ndarray` without PyTorch dependency or Tensor conversion.
+  - Added `safe_dataloader_len(loader)` helper safely returning length or `None` on streaming datasets.
+  - Added support for unindexed iterable/streaming datasets with background prefetching and clean early-break lifecycle.
   - Supports both lists of sample dictionaries and pre-sliced column dictionaries.
 - **Data Speed Benchmarking (`loader.benchmark()` / `benchmark_dataloader()`)**:
   - Measures throughput (batches/sec, samples/sec), latency metrics (mean, min, max, std dev in ms), and total duration.

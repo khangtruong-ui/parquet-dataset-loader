@@ -19,6 +19,8 @@ from parquet_dataset_loader.dataloader import (
     SequentialSampler,
     benchmark_dataloader,
     default_collate,
+    numpy_collate,
+    safe_dataloader_len,
 )
 from parquet_dataset_loader.dataset import (
     BlockShuffledSampler,
@@ -74,6 +76,8 @@ __all__ = [
     "SequentialSampler",
     "RandomSampler",
     "default_collate",
+    "numpy_collate",
+    "safe_dataloader_len",
     "benchmark_dataloader",
     "DatasetManager",
     "get_dataset_manager",
