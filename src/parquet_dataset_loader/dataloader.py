@@ -590,7 +590,21 @@ class DataLoader:
         elif self._is_map:
             self.shuffle = bool(shuffle)
             if self.shuffle:
-                self.sampler = RandomSampler(self.dataset, seed=self.seed)
+                has_row_groups = (
+                    hasattr(self.dataset, "get_row_group_indices")
+                    or (hasattr(self.dataset, "pdl_dataset") and hasattr(self.dataset.pdl_dataset, "get_row_group_indices"))
+                    or (hasattr(self.dataset, "parquet_dataset") and hasattr(self.dataset.parquet_dataset, "get_row_group_indices"))
+                    or (hasattr(self.dataset, "dataset") and hasattr(self.dataset.dataset, "get_row_group_indices"))
+                )
+                if has_row_groups:
+                    from parquet_dataset_loader.dataset import BlockShuffledSampler
+                    self.sampler = BlockShuffledSampler(
+                        self.dataset,
+                        seed=self.seed if self.seed is not None else 42,
+                        shuffle=True,
+                    )
+                else:
+                    self.sampler = RandomSampler(self.dataset, seed=self.seed)
             else:
                 self.sampler = SequentialSampler(self.dataset)
             self.batch_sampler = BatchSampler(self.sampler, self.batch_size, self.drop_last)

@@ -442,3 +442,34 @@ def test_dataloader_iterable_streaming_dataset() -> None:
         if i == 1:
             break
 
+
+def test_dataloader_auto_block_shuffled_sampler(sample_indexed_dataset: IndexedParquetDataset) -> None:
+    """Verify DataLoader(shuffle=True) automatically selects BlockShuffledSampler for row-group locality."""
+    ds = sample_indexed_dataset
+    loader = DataLoader(ds, batch_size=10, shuffle=True, seed=42, num_workers=2)
+
+    assert isinstance(loader.sampler, BlockShuffledSampler)
+    assert loader.sampler.window_blocks == 1
+
+    batches = list(loader)
+    assert len(batches) == 10
+    total_ids = [int(v) for b in batches for v in b["id"]]
+    assert len(total_ids) == 100
+    assert set(total_ids) == set(range(100))
+
+    # Test wrapped dataset with parquet_dataset attribute
+    class WrappedDataset:
+        def __init__(self, inner):
+            self.parquet_dataset = inner
+        def __len__(self):
+            return len(self.parquet_dataset)
+        def __getitem__(self, idx):
+            return self.parquet_dataset[idx]
+
+    wrapped = WrappedDataset(ds)
+    loader_wrapped = DataLoader(wrapped, batch_size=10, shuffle=True, seed=42, num_workers=2)
+    assert isinstance(loader_wrapped.sampler, BlockShuffledSampler)
+    batches_wrapped = list(loader_wrapped)
+    assert len(batches_wrapped) == 10
+
+

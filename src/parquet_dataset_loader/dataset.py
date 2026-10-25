@@ -1135,7 +1135,7 @@ class BlockShuffledSampler:
     ) -> None:
         self.dataset = dataset
         self.window_blocks = max(1, int(window_blocks))
-        self.seed = int(seed)
+        self.seed = int(seed) if seed is not None else random.randint(0, 1_000_000)
         self.shuffle = bool(shuffle)
         self.epoch = 0
 
@@ -1143,6 +1143,10 @@ class BlockShuffledSampler:
             self.groups = dataset.get_row_group_indices()
         elif hasattr(dataset, "pdl_dataset") and hasattr(dataset.pdl_dataset, "get_row_group_indices"):
             self.groups = dataset.pdl_dataset.get_row_group_indices()
+        elif hasattr(dataset, "parquet_dataset") and hasattr(dataset.parquet_dataset, "get_row_group_indices"):
+            self.groups = dataset.parquet_dataset.get_row_group_indices()
+        elif hasattr(dataset, "dataset") and hasattr(dataset.dataset, "get_row_group_indices"):
+            self.groups = dataset.dataset.get_row_group_indices()
         else:
             self.groups = [list(range(len(dataset)))]
 

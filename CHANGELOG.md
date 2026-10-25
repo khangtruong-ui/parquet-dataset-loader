@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Updated `tests/test_benchmark.py` and `examples/custom_dataloader.py`.
 
 ### Fixed
+- **Automatic Row-Group Locality in DataLoader Shuffling (`BlockShuffledSampler`)**:
+  - `DataLoader(shuffle=True)` now automatically detects Parquet datasets and wrapped datasets providing row-group structures and selects `BlockShuffledSampler` by default rather than uniform random sampling.
+  - Prevents multi-worker network thrashing, socket flooding, and timeout errors caused by concurrent worker threads evicting row-group caches and requesting random remote files over HTTP.
+  - Expanded `BlockShuffledSampler` to discover row groups across wrapped dataset adapters (e.g. `parquet_dataset`, `pdl_dataset`, `dataset`).
 - **Thread-Isolated Open File Handles and Connection Pools in `RowGroupReader`**:
   - Replaced shared `_open_files` and filesystem connection with thread-local storage (`threading.local`) so concurrent DataLoader worker threads have dedicated HTTP file handles and LRU pools.
   - Resolved `ValueError: I/O operation on closed file.` caused by cross-thread LRU cache eviction when multiple worker threads read concurrently from remote Parquet files.
