@@ -478,7 +478,7 @@ loader.benchmark(num_batches=50)
 | Feature | Standard PyTorch `DataLoader` | `pdl.DataLoader` (Ours) |
 | :--- | :--- | :--- |
 | **Default `num_workers`** | Requires explicit integer | **Defaults to CPU count** (`num_workers=-1` or `None`) |
-| **Worker Execution** | Fork-based multiprocessing (prone to socket deadlocks) | **Thread or Process workers** (`worker_type="thread"`, zero pickling overhead) |
+| **Worker Execution** | Fork-based multiprocessing (prone to socket deadlocks) | **Thread or Process workers** (`worker_type="thread"`, zero pickling overhead, thread-isolated HTTP sessions & pools) |
 | **Batch Retrieval** | Sample-by-sample ($N \times$ table slices) | **Vectorized contiguous slicing** ($10\times$–$50\times$ faster) |
 | **Collation Robustness**| Crashes on `None`, variable lengths, raw bytes | **Bug-free `default_collate`** (converts tensors safely, preserves lists) |
 | **Clean Termination** | Lingering worker processes on `break` | **Guaranteed zero hangs or zombie processes** |

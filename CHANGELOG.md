@@ -36,6 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `tests/test_dataloader.py` with 15 comprehensive unit tests.
   - Updated `tests/test_benchmark.py` and `examples/custom_dataloader.py`.
 
+### Fixed
+- **Thread-Isolated Open File Handles and Connection Pools in `RowGroupReader`**:
+  - Replaced shared `_open_files` and filesystem connection with thread-local storage (`threading.local`) so concurrent DataLoader worker threads have dedicated HTTP file handles and LRU pools.
+  - Resolved `ValueError: I/O operation on closed file.` caused by cross-thread LRU cache eviction when multiple worker threads read concurrently from remote Parquet files.
+  - Isolated transient error connection resets (`reset_filesystem()`) to the calling worker thread, preventing cascading failures across other active threads.
+  - Global `close()` safely tracks and closes all open handles across all threads under thread lock.
+  - Added graceful termination checks in DataLoader worker threads during raw batch retrieval and result queuing to prevent hangs on early loop breaks.
+
 ## [0.3.2] - 2026-10-07
 
 ### Added

@@ -184,3 +184,37 @@ def test_row_group_reader_evict_and_reset_filesystem(temp_dir: str) -> None:
         reader.close()
 
 
+def test_row_group_reader_multithreaded_concurrency(temp_dir: str) -> None:
+    """Verify RowGroupReader supports concurrent multi-threaded reads across multiple files without handle corruption."""
+    import concurrent.futures
+
+    # Create 10 files
+    files = [
+        create_sample_parquet_file(
+            os.path.join(temp_dir, f"mt_file_{i}.parquet"),
+            num_rows=20,
+            row_group_size=10,
+            start_id=i * 20,
+        )
+        for i in range(10)
+    ]
+
+    # reader with small capacity to trigger frequent evictions
+    reader = RowGroupReader(max_open_files=3)
+    try:
+        def read_task(file_idx: int, rg_idx: int) -> int:
+            tbl = reader.read_row_group(files[file_idx], rg_idx)
+            return tbl.num_rows
+
+        tasks = [(i % 10, (i // 10) % 2) for i in range(50)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(read_task, f_idx, rg_idx) for f_idx, rg_idx in tasks]
+            results = [f.result() for f in futures]
+
+        assert len(results) == 50
+        assert all(r == 10 for r in results)
+    finally:
+        reader.close()
+
+
+

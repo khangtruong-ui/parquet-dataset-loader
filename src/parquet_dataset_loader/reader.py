@@ -64,77 +64,109 @@ class RowGroupReader:
         self.retry_delay = float(retry_delay)
         self.max_retry_delay = float(max_retry_delay)
 
-        self._open_files: OrderedDict[str, Tuple[Any, pq.ParquetFile]] = OrderedDict()
+        self._local = threading.local()
         self._lock = threading.Lock()
-        self._http_fs = None
-        self._http_fs_pid = None
-        # Initialize filesystem for current process
+        self._all_active_fps: set = set()
+        # Initialize filesystem for current thread/process
         _ = self.http_fs
 
     @property
+    def _open_files(self) -> OrderedDict[str, Tuple[Any, pq.ParquetFile]]:
+        if not hasattr(self._local, "open_files") or self._local.open_files is None:
+            self._local.open_files = OrderedDict()
+        return self._local.open_files
+
+    @_open_files.setter
+    def _open_files(self, value: OrderedDict[str, Tuple[Any, pq.ParquetFile]]) -> None:
+        self._local.open_files = value
+
+    @property
+    def _http_fs(self) -> Any:
+        return getattr(self._local, "http_fs", None)
+
+    @_http_fs.setter
+    def _http_fs(self, value: Any) -> None:
+        self._local.http_fs = value
+
+    @property
+    def _http_fs_pid(self) -> Any:
+        return getattr(self._local, "http_fs_pid", None)
+
+    @_http_fs_pid.setter
+    def _http_fs_pid(self, value: Any) -> None:
+        self._local.http_fs_pid = value
+
+    @property
     def http_fs(self) -> Any:
-        """Obtain a fork-safe fsspec HTTP filesystem for current process."""
+        """Obtain a fork-safe and thread-isolated fsspec HTTP filesystem for current process and thread."""
         current_pid = os.getpid()
-        if (
-            not hasattr(self, "_http_fs_pid")
-            or self._http_fs_pid != current_pid
-            or getattr(self, "_http_fs", None) is None
-        ):
+        local_pid = getattr(self._local, "http_fs_pid", None)
+        local_fs = getattr(self._local, "http_fs", None)
+        if local_pid != current_pid or local_fs is None:
             headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
-            self._http_fs = fsspec.filesystem("http", headers=headers)
-            self._http_fs_pid = current_pid
-            self._lock = threading.Lock()
-            if hasattr(self, "_open_files"):
-                for _, (fp, _) in list(self._open_files.items()):
+            self._local.http_fs = fsspec.filesystem("http", headers=headers)
+            self._local.http_fs_pid = current_pid
+            if hasattr(self._local, "open_files") and self._local.open_files:
+                for _, (fp, _) in list(self._local.open_files.items()):
+                    with self._lock:
+                        self._all_active_fps.discard(fp)
                     try:
                         fp.close()
                     except Exception:
                         pass
-                self._open_files.clear()
-        return self._http_fs
+                self._local.open_files.clear()
+            else:
+                self._local.open_files = OrderedDict()
+        return self._local.http_fs
 
     def _evict_file(self, file_url_or_path: str) -> None:
-        """Safely close and remove an open file handle from cache."""
-        with self._lock:
-            if file_url_or_path in self._open_files:
-                fp, _ = self._open_files.pop(file_url_or_path)
-                try:
-                    fp.close()
-                except Exception:
-                    pass
+        """Safely close and remove an open file handle from current thread's cache."""
+        open_files = self._open_files
+        if file_url_or_path in open_files:
+            fp, _ = open_files.pop(file_url_or_path)
+            with self._lock:
+                self._all_active_fps.discard(fp)
+            try:
+                fp.close()
+            except Exception:
+                pass
 
     def reset_filesystem(self) -> None:
-        """Close all open files and reset HTTP filesystem connection pool."""
-        with self._lock:
-            for _, (fp, _) in list(self._open_files.items()):
+        """Close current thread's open files and reset its HTTP filesystem connection pool."""
+        if hasattr(self._local, "open_files") and self._local.open_files:
+            for _, (fp, _) in list(self._local.open_files.items()):
+                with self._lock:
+                    self._all_active_fps.discard(fp)
                 try:
                     fp.close()
                 except Exception:
                     pass
-            self._open_files.clear()
-            self._http_fs = None
-            self._http_fs_pid = None
+            self._local.open_files.clear()
+        self._local.http_fs = None
+        self._local.http_fs_pid = None
 
     def _get_parquet_file(self, file_url_or_path: str, max_attempts: int = 3) -> pq.ParquetFile:
-        """Obtain a reusable ParquetFile instance for the specified file with retry on remote open."""
+        """Obtain a reusable ParquetFile instance for current thread with retry on remote open."""
         is_remote = file_url_or_path.startswith(("http://", "https://"))
         attempts = max_attempts if is_remote else 1
         last_exc: Optional[Exception] = None
 
         for attempt in range(attempts):
             _ = self.http_fs
-            with self._lock:
-                if file_url_or_path in self._open_files:
-                    self._open_files.move_to_end(file_url_or_path)
-                    _, pf = self._open_files[file_url_or_path]
-                    return pf
+            open_files = self._open_files
+            if file_url_or_path in open_files:
+                open_files.move_to_end(file_url_or_path)
+                _, pf = open_files[file_url_or_path]
+                return pf
 
-                if len(self._open_files) >= self.max_open_files:
-                    oldest_url, (fp, _) = self._open_files.popitem(last=False)
-                    try:
-                        fp.close()
-                    except Exception:
-                        pass
+            if len(open_files) >= self.max_open_files:
+                oldest_url, (fp, _) = open_files.popitem(last=False)
+                with self._lock:
+                    self._all_active_fps.discard(fp)
+                try:
+                    fp.close()
+                except Exception:
+                    pass
 
             fp = None
             try:
@@ -147,16 +179,19 @@ class RowGroupReader:
                     pf = pq.ParquetFile(fp, memory_map=True)
 
                 with self._lock:
-                    self._open_files[file_url_or_path] = (fp, pf)
+                    self._all_active_fps.add(fp)
+                open_files[file_url_or_path] = (fp, pf)
                 return pf
             except Exception as exc:
                 last_exc = exc
                 if fp is not None:
+                    with self._lock:
+                        self._all_active_fps.discard(fp)
                     try:
                         fp.close()
                     except Exception:
                         pass
-                if is_remote and attempt < attempts - 1:
+                if is_remote and attempt < attempts - 1 and "cannot schedule new futures" not in str(exc).lower():
                     logger.warning(
                         f"⚠️ Error opening remote ParquetFile '{file_url_or_path}' "
                         f"(attempt {attempt + 1}/{attempts}): {exc}. Resetting filesystem and retrying..."
@@ -228,7 +263,7 @@ class RowGroupReader:
                 last_error = e
                 # Evict the potentially severed/corrupted file handle from pool
                 self._evict_file(file_url)
-                if is_remote and attempt < max_attempts - 1:
+                if is_remote and attempt < max_attempts - 1 and "cannot schedule new futures" not in str(e).lower():
                     delay = min(self.max_retry_delay, self.retry_delay * (2 ** attempt))
                     logger.warning(
                         f"⚠️ Transient error reading row group {rg_index} from '{file_url}' "
@@ -265,11 +300,20 @@ class RowGroupReader:
     def close(self) -> None:
         """Close all open file handles and clear caches."""
         self.reset_filesystem()
+        with self._lock:
+            for fp in list(self._all_active_fps):
+                try:
+                    fp.close()
+                except Exception:
+                    pass
+            self._all_active_fps.clear()
         self.memory_cache.clear()
 
     def __getstate__(self) -> Dict[str, Any]:
         state = self.__dict__.copy()
         state.pop("_lock", None)
+        state.pop("_local", None)
+        state.pop("_all_active_fps", None)
         state.pop("_open_files", None)
         state.pop("_http_fs", None)
         state.pop("_http_fs_pid", None)
@@ -277,10 +321,9 @@ class RowGroupReader:
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
         self.__dict__.update(state)
+        self._local = threading.local()
         self._lock = threading.Lock()
-        self._open_files = OrderedDict()
-        self._http_fs = None
-        self._http_fs_pid = None
+        self._all_active_fps = set()
 
 
 

@@ -1015,12 +1015,18 @@ class DataLoader:
 
                     batch_idx, indices = task
                     try:
+                        if shutdown_event.is_set():
+                            break
                         t0 = time.perf_counter()
                         raw = self._fetch_raw_batch(self.dataset, indices)
+                        if shutdown_event.is_set():
+                            break
                         t1 = time.perf_counter()
 
                         t2 = time.perf_counter()
                         collated = self.collate_fn(raw)
+                        if shutdown_event.is_set():
+                            break
                         t3 = time.perf_counter()
 
                         if self.pin_memory:
@@ -1031,10 +1037,19 @@ class DataLoader:
                             "collate_time": t3 - t2,
                             "num_samples": float(len(indices)),
                         }
-                        result_queue.put((batch_idx, collated, timings))
+                        while not shutdown_event.is_set():
+                            try:
+                                result_queue.put((batch_idx, collated, timings), timeout=0.2)
+                                break
+                            except queue.Full:
+                                continue
                     except BaseException as e:
-                        tb = traceback.format_exc()
-                        result_queue.put((batch_idx, _WorkerExceptionWrapper(e, tb), {}))
+                        if not shutdown_event.is_set():
+                            tb = traceback.format_exc()
+                            try:
+                                result_queue.put((batch_idx, _WorkerExceptionWrapper(e, tb), {}), timeout=0.2)
+                            except Exception:
+                                pass
                     finally:
                         task_queue.task_done()
 
