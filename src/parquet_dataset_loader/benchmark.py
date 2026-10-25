@@ -59,6 +59,30 @@ def parse_args(argv=None):
         default=0,
         help="Number of warmup runs before measurement begins.",
     )
+    parser.add_argument(
+        "--dataloader",
+        action="store_true",
+        default=False,
+        help="Benchmark DataLoader throughput and bottleneck diagnostics.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Batch size for DataLoader benchmark.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=-1,
+        help="Number of DataLoader workers (-1 or None infers CPU count).",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Enable debug mode to profile and view DataLoader bottlenecks.",
+    )
     return parser.parse_args(argv)
 
 
@@ -177,6 +201,25 @@ def run_benchmark(args):
             if count >= 3:
                 break
     measure_operation("Stream 3 rows", stream_data, runs=args.runs, warmup=args.warmup, scale_to_ms=True)
+
+    # 6. Optional DataLoader Benchmark
+    if getattr(args, "dataloader", False):
+        print("\n" + "=" * 70)
+        print("Running DataLoader Speed Benchmark & Bottleneck Check...")
+        print("=" * 70)
+        loader = pdl.DataLoader(
+            ds,
+            batch_size=getattr(args, "batch_size", 32),
+            num_workers=getattr(args, "num_workers", -1),
+            debug=getattr(args, "debug", False),
+        )
+        loader.benchmark(
+            num_batches=max(10, args.runs * 10),
+            warmup=max(1, args.warmup),
+            show_summary=True,
+        )
+        if getattr(args, "debug", False):
+            loader.view_bottleneck()
 
     print("=" * 70)
     print("Benchmark completed.")

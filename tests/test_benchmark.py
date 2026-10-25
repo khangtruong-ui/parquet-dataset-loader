@@ -57,3 +57,30 @@ def test_run_benchmark(mock_load_dataset, capsys):
     assert "Fetch index 0" in captured.out
     assert "Seek to index 500" in captured.out
     assert "Stream 3 rows" in captured.out
+
+
+@patch("parquet_dataset_loader.benchmark.pdl.DataLoader")
+@patch("parquet_dataset_loader.benchmark.pdl.load_dataset")
+def test_run_benchmark_with_dataloader(mock_load_dataset, mock_dataloader_cls, capsys):
+    mock_ds = MagicMock()
+    mock_ds.__len__.return_value = 500
+    mock_ds.column_names = ["mask"]
+    mock_ds.__getitem__.return_value = {"mask": b"data"}
+    mock_ds.iter_from.return_value = [{"mask": b"d1"}, {"mask": b"d2"}, {"mask": b"d3"}]
+    mock_load_dataset.return_value = mock_ds
+
+    mock_loader = MagicMock()
+    mock_loader.benchmark.return_value = {"total_batches": 10, "batches_per_sec": 100.0}
+    mock_dataloader_cls.return_value = mock_loader
+
+    args = parse_args(["--path", "dummy", "--dataloader", "--batch-size", "16", "--num-workers", "4", "--debug"])
+    assert args.dataloader is True
+    assert args.batch_size == 16
+    assert args.num_workers == 4
+    assert args.debug is True
+
+    exit_code = run_benchmark(args)
+    assert exit_code == 0
+    mock_dataloader_cls.assert_called_once_with(mock_ds, batch_size=16, num_workers=4, debug=True)
+    mock_loader.benchmark.assert_called_once()
+    mock_loader.view_bottleneck.assert_called_once()
