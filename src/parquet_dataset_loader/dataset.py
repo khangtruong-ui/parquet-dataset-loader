@@ -893,6 +893,11 @@ class IndexedParquetDataset(collections.abc.Sequence):
         pin_memory: bool = False,
         debug: bool = False,
         seed: Optional[int] = None,
+        num_shards: Optional[int] = None,
+        shard_id: Optional[int] = None,
+        world_size: Optional[int] = None,
+        rank: Optional[int] = None,
+        contiguous_shards: bool = False,
     ) -> Any:
         """Create a high-performance, bug-free DataLoader for this dataset."""
         from parquet_dataset_loader.dataloader import DataLoader
@@ -912,6 +917,11 @@ class IndexedParquetDataset(collections.abc.Sequence):
             pin_memory=pin_memory,
             debug=debug,
             seed=seed if seed is not None else self.seed,
+            num_shards=num_shards,
+            shard_id=shard_id,
+            world_size=world_size,
+            rank=rank,
+            contiguous_shards=contiguous_shards,
         )
 
     def dataloader(self, **kwargs: Any) -> Any:
@@ -1085,6 +1095,32 @@ class ParquetDatasetDict(dict):
             ds.save_to_disk(split_dir)
 
         return abs_target_dir
+
+    def shard(
+        self,
+        num_shards: int,
+        index: int,
+        contiguous: bool = False,
+    ) -> ParquetDatasetDict:
+        """Shard all dataset splits in this dictionary across distributed ranks.
+
+        Args:
+            num_shards: Total number of shards (e.g. world_size).
+            index: Current shard index (0 to num_shards - 1).
+            contiguous: If True, uses contiguous chunk sharding; otherwise strided.
+
+        Returns:
+            A new ParquetDatasetDict with each split sharded.
+        """
+        sharded_dict = {}
+        for split_name, ds in self.items():
+            if hasattr(ds, "shard"):
+                sharded_dict[split_name] = ds.shard(
+                    num_shards=num_shards, index=index, contiguous=contiguous
+                )
+            else:
+                sharded_dict[split_name] = ds
+        return ParquetDatasetDict(sharded_dict)
 
     def to_dataloader(
         self,

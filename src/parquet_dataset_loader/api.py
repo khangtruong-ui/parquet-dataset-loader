@@ -87,6 +87,11 @@ def load_dataset(
     max_cached_files: Optional[int] = None,
     max_cache_gb: Optional[float] = None,
     cache_files: Optional[bool] = None,
+    num_shards: Optional[int] = None,
+    shard_id: Optional[int] = None,
+    world_size: Optional[int] = None,
+    rank: Optional[int] = None,
+    contiguous_shards: bool = False,
     **kwargs: Any,
 ) -> Union[IndexedParquetDataset, ParquetDatasetDict]:
     """Load a Parquet dataset from Hugging Face Hub, local files, or remote URLs.
@@ -350,6 +355,19 @@ def load_dataset(
     else:
         result_ds = ParquetDatasetDict(datasets, dataset_id=dataset_id)
 
+    # Apply distributed sharding if requested
+    resolved_shards = num_shards if num_shards is not None else world_size
+    resolved_shard_id = shard_id if shard_id is not None else (rank if rank is not None else 0)
+    if resolved_shards is not None and resolved_shards > 1:
+        if hasattr(result_ds, "shard"):
+            result_ds = result_ds.shard(
+                num_shards=resolved_shards,
+                index=resolved_shard_id,
+                contiguous=contiguous_shards,
+            )
+        else:
+            logger.warning(f"Loaded dataset object of type {type(result_ds)} does not support .shard()")
+
     if manage:
         get_dataset_manager().register(result_ds, dataset_id=dataset_id)
 
@@ -371,6 +389,11 @@ def load_from_disk(
     token: Optional[Union[bool, str]] = None,
     dataset_id: Optional[str] = None,
     manage: bool = True,
+    num_shards: Optional[int] = None,
+    shard_id: Optional[int] = None,
+    world_size: Optional[int] = None,
+    rank: Optional[int] = None,
+    contiguous_shards: bool = False,
     **kwargs: Any,
 ) -> Union[IndexedParquetDataset, ParquetDatasetDict]:
     """Load a dataset previously saved to disk via save_to_disk().
@@ -548,6 +571,14 @@ def load_from_disk(
                 **kwargs,
             )  # type: ignore
         dict_res = ParquetDatasetDict(splits_dict, dataset_id=dataset_id)
+        resolved_shards = num_shards if num_shards is not None else world_size
+        resolved_shard_id = shard_id if shard_id is not None else (rank if rank is not None else 0)
+        if resolved_shards is not None and resolved_shards > 1:
+            dict_res = dict_res.shard(
+                num_shards=resolved_shards,
+                index=resolved_shard_id,
+                contiguous=contiguous_shards,
+            )
         if manage:
             get_dataset_manager().register(dict_res, dataset_id=dataset_id)
         return dict_res
@@ -755,6 +786,11 @@ def resume_dataset(
     token: Optional[Union[bool, str]] = None,
     dataset_id: Optional[str] = None,
     manage: bool = True,
+    num_shards: Optional[int] = None,
+    shard_id: Optional[int] = None,
+    world_size: Optional[int] = None,
+    rank: Optional[int] = None,
+    contiguous_shards: bool = False,
     **kwargs: Any,
 ) -> Union[IndexedParquetDataset, ParquetDatasetDict]:
     """Resume saving/downloading an incomplete dataset on disk.
