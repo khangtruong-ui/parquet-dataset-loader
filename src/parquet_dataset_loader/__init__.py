@@ -15,6 +15,7 @@ from parquet_dataset_loader.cache import DiskCache, FileCache, RowGroupMemoryCac
 from parquet_dataset_loader.dataloader import (
     BatchSampler,
     DataLoader,
+    DistributedSampler,
     RandomSampler,
     SequentialSampler,
     benchmark_dataloader,
@@ -72,6 +73,7 @@ __all__ = [
     "IndexedParquetDataset",
     "ParquetDatasetDict",
     "DataLoader",
+    "DistributedSampler",
     "BatchSampler",
     "SequentialSampler",
     "RandomSampler",

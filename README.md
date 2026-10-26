@@ -638,8 +638,8 @@ dataloader = DataLoader(
 )
 ```
 
-### 3. Distributed Sharding (`ds.shard(...)` and `ds.n_shards`)
-Easily shard across PyTorch DistributedDataParallel (DDP) ranks or across manual worker slices:
+### 3. Distributed Sharding (`ds.shard(...)`, `DataLoader(num_shards=..., shard_id=...)`, and `DistributedSampler`)
+Easily shard across PyTorch DistributedDataParallel (DDP) ranks, JAX multi-device setups, or manual worker slices:
 
 ```python
 # Shard across 4 GPUs for rank 0:
@@ -651,6 +651,18 @@ chunk_shard = ds.shard(num_shards=4, index=0, contiguous=True)
 
 # Query number of underlying Parquet files / shards:
 print(f"Number of parquet shards: {ds.n_shards}")
+
+# Direct DataLoader multi-device sharding (each device receives non-overlapping batches):
+loader = DataLoader(ds, batch_size=32, num_shards=4, shard_id=0, shuffle=True)
+for epoch in range(10):
+    loader.set_epoch(epoch)
+    for batch in loader:
+        ...
+
+# Or using DistributedSampler directly:
+from parquet_dataset_loader import DistributedSampler
+sampler = DistributedSampler(ds, num_replicas=4, rank=0, shuffle=True)
+loader = DataLoader(ds, batch_size=32, sampler=sampler)
 ```
 
 ### 4. Arbitrary Index Selection (`ds.select(...)`)

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-10-26
+
+### Added
+- **Multi-Device and Distributed Sharding Support**:
+  - Added `DistributedSampler` class in `parquet_dataset_loader.dataloader` (and package export in `__all__`) for partitioning samples across distributed workers/devices (`num_replicas`/`num_shards`, `rank`/`shard_id`, `shuffle`, `seed`, `drop_last`, `contiguous`).
+  - Added `num_shards` and `shard_id` (along with aliases `world_size` and `rank`) directly to `DataLoader`, ensuring different devices receive completely non-overlapping batches.
+  - Added `set_epoch(epoch)` propagation on `DataLoader` to synchronize deterministic yet distinct distributed shuffling across epochs.
+  - Added `.shard(num_shards, index, contiguous=False)` method to `ParquetDatasetDict` to shard all dictionary splits simultaneously.
+  - Added `num_shards`, `shard_id`, `world_size`, `rank`, and `contiguous_shards` parameters to `load_dataset(...)` and `load_from_disk(...)`.
+  - Added `to_dataloader(..., num_shards=..., shard_id=...)` argument propagation.
+  - Added complete test suite in `tests/test_sharding.py`.
+
 ## [0.4.0] - 2026-10-25
 
 ### Added

@@ -127,6 +127,108 @@ class RandomSampler:
             yield from indices
 
 
+class DistributedSampler:
+    """Sampler that restricts data loading to a subset of the dataset for multi-device/distributed execution.
+
+    Divides dataset sample indices across `num_replicas` (or `num_shards`) partitions such that
+    device `rank` (or `shard_id`) receives only its corresponding slice, ensuring different devices
+    process completely non-overlapping batches.
+
+    Args:
+        data_source: Dataset or sequence to sample from.
+        num_replicas: Number of processes/devices participating in distributed training (default: 1).
+        rank: Rank/shard_id of the current process within `num_replicas` (default: 0).
+        shuffle: If True, shuffles indices before partitioning (default: True).
+        seed: Random seed for deterministic shuffling across replicas (default: 0).
+        drop_last: If True, drops tail data to ensure equal sample counts per replica (default: False).
+        contiguous: If True, partitions into contiguous slices instead of interleaved (default: False).
+        num_shards: Alias for `num_replicas`.
+        shard_id: Alias for `rank`.
+    """
+
+    def __init__(
+        self,
+        data_source: Any,
+        num_replicas: Optional[int] = None,
+        rank: Optional[int] = None,
+        shuffle: bool = True,
+        seed: int = 0,
+        drop_last: bool = False,
+        contiguous: bool = False,
+        num_shards: Optional[int] = None,
+        shard_id: Optional[int] = None,
+    ) -> None:
+        self.data_source = data_source
+        resolved_replicas = num_replicas if num_replicas is not None else num_shards
+        resolved_rank = rank if rank is not None else shard_id
+
+        if resolved_replicas is None:
+            resolved_replicas = 1
+        if resolved_rank is None:
+            resolved_rank = 0
+
+        resolved_replicas = int(resolved_replicas)
+        resolved_rank = int(resolved_rank)
+
+        if resolved_replicas <= 0:
+            raise ValueError(f"num_replicas / num_shards must be positive, got {resolved_replicas}")
+        if resolved_rank < 0 or resolved_rank >= resolved_replicas:
+            raise ValueError(
+                f"rank / shard_id must be in range [0, {resolved_replicas - 1}], got {resolved_rank}"
+            )
+
+        self.num_replicas = resolved_replicas
+        self.rank = resolved_rank
+        self.num_shards = self.num_replicas
+        self.shard_id = self.rank
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+        self.contiguous = bool(contiguous)
+        self.epoch = 0
+
+        total_size = len(self.data_source)
+        if self.drop_last:
+            self.num_samples = total_size // self.num_replicas
+            self.total_size = self.num_samples * self.num_replicas
+        else:
+            self.num_samples = (total_size + self.num_replicas - 1) // self.num_replicas
+            self.total_size = self.num_samples * self.num_replicas
+
+    def set_epoch(self, epoch: int) -> None:
+        """Update epoch index for varied deterministic shuffling across epochs."""
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __iter__(self) -> Iterator[int]:
+        n = len(self.data_source)
+        if self.shuffle:
+            rng = random.Random(self.seed + self.epoch)
+            indices = list(range(n))
+            rng.shuffle(indices)
+        else:
+            indices = list(range(n))
+
+        if not self.drop_last:
+            padding_size = self.total_size - len(indices)
+            if padding_size > 0:
+                if padding_size <= len(indices):
+                    indices = indices + indices[:padding_size]
+                else:
+                    indices = indices + (indices * ((padding_size // len(indices)) + 1))[:padding_size]
+        else:
+            indices = indices[:self.total_size]
+
+        if self.contiguous:
+            start = self.rank * self.num_samples
+            end = start + self.num_samples
+            return iter(indices[start:end])
+        else:
+            return iter(indices[self.rank:self.total_size:self.num_replicas])
+
+
 class BatchSampler:
     """Wraps another sampler to yield mini-batches of indices.
 
@@ -509,6 +611,11 @@ class DataLoader:
         pin_memory: Whether to copy tensors into CUDA pinned memory (default: False).
         debug: If True, enables fine-grained bottleneck profiling (default: False).
         seed: Optional random seed for reproducible shuffling.
+        num_shards: Total number of distributed devices/partitions (e.g. world_size).
+        shard_id: Rank/shard_id of this device/process within `num_shards`.
+        world_size: Alias for `num_shards`.
+        rank: Alias for `shard_id`.
+        contiguous_shards: If True, partitions into contiguous slices instead of interleaved (default: False).
     """
 
     def __init__(
@@ -527,6 +634,11 @@ class DataLoader:
         pin_memory: bool = False,
         debug: bool = False,
         seed: Optional[int] = None,
+        num_shards: Optional[int] = None,
+        shard_id: Optional[int] = None,
+        world_size: Optional[int] = None,
+        rank: Optional[int] = None,
+        contiguous_shards: bool = False,
     ) -> None:
         # Handle ParquetDatasetDict convenience: if dictionary passed, warn or select first split
         if isinstance(dataset, dict) and not hasattr(dataset, "__getitem__"):
@@ -544,6 +656,21 @@ class DataLoader:
         self.debug = bool(debug)
         self.seed = seed
         self.epoch = 0
+
+        # Sharding configuration
+        resolved_shards = num_shards if num_shards is not None else world_size
+        resolved_shard_id = shard_id if shard_id is not None else rank
+        self.num_shards = int(resolved_shards) if resolved_shards is not None else None
+        self.shard_id = int(resolved_shard_id) if resolved_shard_id is not None else 0
+        self.contiguous_shards = bool(contiguous_shards)
+
+        if self.num_shards is not None:
+            if self.num_shards <= 0:
+                raise ValueError(f"num_shards / world_size must be positive, got {self.num_shards}")
+            if self.shard_id < 0 or self.shard_id >= self.num_shards:
+                raise ValueError(
+                    f"shard_id / rank must be in range [0, {self.num_shards - 1}], got {self.shard_id}"
+                )
 
         # Infer num_workers: default is CPU count, -1 also infers CPU count
         if num_workers is None or num_workers == -1:
@@ -584,12 +711,32 @@ class DataLoader:
         elif sampler is not None:
             if shuffle:
                 raise ValueError("sampler option is mutually exclusive with shuffle")
-            self.sampler = sampler
+            if self.num_shards is not None and self.num_shards > 1 and not isinstance(sampler, DistributedSampler):
+                self.sampler = DistributedSampler(
+                    sampler,
+                    num_replicas=self.num_shards,
+                    rank=self.shard_id,
+                    shuffle=False,
+                    drop_last=self.drop_last,
+                    contiguous=self.contiguous_shards,
+                )
+            else:
+                self.sampler = sampler
             self.batch_sampler = BatchSampler(self.sampler, self.batch_size, self.drop_last)
             self.shuffle = False
         elif self._is_map:
             self.shuffle = bool(shuffle)
-            if self.shuffle:
+            if self.num_shards is not None and self.num_shards > 1:
+                self.sampler = DistributedSampler(
+                    self.dataset,
+                    num_replicas=self.num_shards,
+                    rank=self.shard_id,
+                    shuffle=self.shuffle,
+                    seed=self.seed if self.seed is not None else 0,
+                    drop_last=self.drop_last,
+                    contiguous=self.contiguous_shards,
+                )
+            elif self.shuffle:
                 has_row_groups = (
                     hasattr(self.dataset, "get_row_group_indices")
                     or (hasattr(self.dataset, "pdl_dataset") and hasattr(self.dataset.pdl_dataset, "get_row_group_indices"))
@@ -643,8 +790,10 @@ class DataLoader:
         self.epoch = int(epoch)
         if hasattr(self.sampler, "set_epoch"):
             self.sampler.set_epoch(epoch)
-        elif hasattr(self.batch_sampler, "set_epoch"):
+        if hasattr(self.batch_sampler, "set_epoch"):
             self.batch_sampler.set_epoch(epoch)
+        if hasattr(self.dataset, "set_epoch"):
+            self.dataset.set_epoch(epoch)
 
     def enable_debug(self) -> None:
         """Enable fine-grained bottleneck profiling for subsequent runs."""
@@ -821,6 +970,10 @@ class DataLoader:
             for item in self.dataset:
                 cur_batch.append(item)
                 if len(cur_batch) == self.batch_size:
+                    if self.num_shards is not None and self.num_shards > 1 and (batch_idx % self.num_shards) != self.shard_id:
+                        batch_idx += 1
+                        cur_batch = []
+                        continue
                     t_start = time.perf_counter()
                     t0 = time.perf_counter()
                     batch = self.collate_fn(cur_batch)
@@ -851,22 +1004,23 @@ class DataLoader:
                     cur_batch = []
                     yield batch
             if cur_batch and not self.drop_last:
-                t_start = time.perf_counter()
-                t0 = time.perf_counter()
-                batch = self.collate_fn(cur_batch)
-                t1 = time.perf_counter()
-                if self.pin_memory:
-                    batch = pin_memory_batch(batch)
-                step_time = time.perf_counter() - t_start
-                self._check_health_and_warn(
-                    batch_idx=batch_idx,
-                    batch=batch,
-                    step_time=step_time,
-                    queue_wait_time=0.0,
-                    recent_step_times=recent_step_times,
-                )
-                recent_step_times.append(step_time)
-                yield batch
+                if self.num_shards is None or self.num_shards <= 1 or (batch_idx % self.num_shards) == self.shard_id:
+                    t_start = time.perf_counter()
+                    t0 = time.perf_counter()
+                    batch = self.collate_fn(cur_batch)
+                    t1 = time.perf_counter()
+                    if self.pin_memory:
+                        batch = pin_memory_batch(batch)
+                    step_time = time.perf_counter() - t_start
+                    self._check_health_and_warn(
+                        batch_idx=batch_idx,
+                        batch=batch,
+                        step_time=step_time,
+                        queue_wait_time=0.0,
+                        recent_step_times=recent_step_times,
+                    )
+                    recent_step_times.append(step_time)
+                    yield batch
 
     def _iter_streaming_multi_worker(self) -> Iterator[Any]:
         """Streaming background prefetching for unindexed Iterable datasets."""
@@ -885,6 +1039,10 @@ class DataLoader:
                         break
                     cur_batch.append(item)
                     if len(cur_batch) == self.batch_size:
+                        if self.num_shards is not None and self.num_shards > 1 and (batch_idx % self.num_shards) != self.shard_id:
+                            batch_idx += 1
+                            cur_batch = []
+                            continue
                         t0 = time.perf_counter()
                         collated = self.collate_fn(cur_batch)
                         t1 = time.perf_counter()
@@ -900,18 +1058,19 @@ class DataLoader:
                         batch_idx += 1
                         cur_batch = []
                 if cur_batch and not self.drop_last and not shutdown_event.is_set():
-                    t0 = time.perf_counter()
-                    collated = self.collate_fn(cur_batch)
-                    t1 = time.perf_counter()
-                    if self.pin_memory:
-                        collated = pin_memory_batch(collated)
-                    timings = {"fetch_time": 0.0, "collate_time": t1 - t0, "num_samples": float(len(cur_batch))}
-                    while not shutdown_event.is_set():
-                        try:
-                            q.put((batch_idx, collated, timings), timeout=0.2)
-                            break
-                        except queue.Full:
-                            continue
+                    if self.num_shards is None or self.num_shards <= 1 or (batch_idx % self.num_shards) == self.shard_id:
+                        t0 = time.perf_counter()
+                        collated = self.collate_fn(cur_batch)
+                        t1 = time.perf_counter()
+                        if self.pin_memory:
+                            collated = pin_memory_batch(collated)
+                        timings = {"fetch_time": 0.0, "collate_time": t1 - t0, "num_samples": float(len(cur_batch))}
+                        while not shutdown_event.is_set():
+                            try:
+                                q.put((batch_idx, collated, timings), timeout=0.2)
+                                break
+                            except queue.Full:
+                                continue
             except BaseException as exc:
                 tb = traceback.format_exc()
                 try:
