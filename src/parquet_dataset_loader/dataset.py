@@ -1208,6 +1208,8 @@ class BlockShuffledSampler:
 
         if hasattr(dataset, "get_row_group_indices"):
             self.groups = dataset.get_row_group_indices()
+        elif hasattr(dataset, "data") and hasattr(dataset.data, "get_row_group_indices"):
+            self.groups = dataset.data.get_row_group_indices()
         elif hasattr(dataset, "pdl_dataset") and hasattr(dataset.pdl_dataset, "get_row_group_indices"):
             self.groups = dataset.pdl_dataset.get_row_group_indices()
         elif hasattr(dataset, "parquet_dataset") and hasattr(dataset.parquet_dataset, "get_row_group_indices"):
@@ -1231,6 +1233,7 @@ class BlockShuffledSampler:
         self.file_indices: Optional[List[int]] = None
         for obj in (
             dataset,
+            getattr(dataset, "data", None),
             getattr(dataset, "pdl_dataset", None),
             getattr(dataset, "parquet_dataset", None),
             getattr(dataset, "dataset", None),

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-10-28
+
+### Added
+- **Wrapper Dataset Row-Group Discovery in `DataLoader`**:
+  - `DataLoader` and `BlockShuffledSampler` now inspect `dataset.data` (in addition to `dataset.pdl_dataset`, `dataset.parquet_dataset`, and `dataset.dataset`) to discover `get_row_group_indices` and `get_row_group_file_indices`.
+  - Automatically selects `BlockShuffledSampler` for wrapped datasets (e.g. `SIDMapDataset`), preventing accidental fallback to `RandomSampler` and eliminating 100% cache-miss row group thrashing on streaming Parquet datasets.
+- **Row-Group Locality in `DistributedSampler`**:
+  - `DistributedSampler` now preserves row-group locality when `shuffle=True` by utilizing `BlockShuffledSampler` to construct the shuffled permutation sequence prior to rank partitioning.
+- **Resilient Reader Shutdown**:
+  - `RowGroupReader` ignores transient `_log_stats` attribute errors from closed `fsspec` caches during background worker shutdown, preventing spurious error messages.
+
+
 ## [0.4.1] - 2026-10-26
 
 ### Added

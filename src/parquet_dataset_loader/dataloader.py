@@ -205,9 +205,22 @@ class DistributedSampler:
     def __iter__(self) -> Iterator[int]:
         n = len(self.data_source)
         if self.shuffle:
-            rng = random.Random(self.seed + self.epoch)
-            indices = list(range(n))
-            rng.shuffle(indices)
+            has_row_groups = (
+                hasattr(self.data_source, "get_row_group_indices")
+                or (hasattr(self.data_source, "data") and hasattr(self.data_source.data, "get_row_group_indices"))
+                or (hasattr(self.data_source, "pdl_dataset") and hasattr(self.data_source.pdl_dataset, "get_row_group_indices"))
+                or (hasattr(self.data_source, "parquet_dataset") and hasattr(self.data_source.parquet_dataset, "get_row_group_indices"))
+                or (hasattr(self.data_source, "dataset") and hasattr(self.data_source.dataset, "get_row_group_indices"))
+            )
+            if has_row_groups:
+                from parquet_dataset_loader.dataset import BlockShuffledSampler
+                bss = BlockShuffledSampler(self.data_source, seed=self.seed, shuffle=True)
+                bss.set_epoch(self.epoch)
+                indices = list(bss)
+            else:
+                rng = random.Random(self.seed + self.epoch)
+                indices = list(range(n))
+                rng.shuffle(indices)
         else:
             indices = list(range(n))
 
@@ -739,6 +752,7 @@ class DataLoader:
             elif self.shuffle:
                 has_row_groups = (
                     hasattr(self.dataset, "get_row_group_indices")
+                    or (hasattr(self.dataset, "data") and hasattr(self.dataset.data, "get_row_group_indices"))
                     or (hasattr(self.dataset, "pdl_dataset") and hasattr(self.dataset.pdl_dataset, "get_row_group_indices"))
                     or (hasattr(self.dataset, "parquet_dataset") and hasattr(self.dataset.parquet_dataset, "get_row_group_indices"))
                     or (hasattr(self.dataset, "dataset") and hasattr(self.dataset.dataset, "get_row_group_indices"))

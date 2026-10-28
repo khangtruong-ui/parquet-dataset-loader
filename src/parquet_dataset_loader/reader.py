@@ -295,7 +295,7 @@ class RowGroupReader:
                 self._evict_file(file_url)
                 is_rate_limit = "429" in str(e) or "too many requests" in str(e).lower()
                 effective_attempts = max(max_attempts, 6) if is_rate_limit else max_attempts
-                if is_remote and attempt < effective_attempts - 1 and "cannot schedule new futures" not in str(e).lower():
+                if is_remote and attempt < effective_attempts - 1 and "cannot schedule new futures" not in str(e).lower() and "_log_stats" not in str(e).lower():
                     delay = (
                         min(self.max_retry_delay * 4, 3.0 * (2 ** attempt))
                         if is_rate_limit

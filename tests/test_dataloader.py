@@ -472,4 +472,39 @@ def test_dataloader_auto_block_shuffled_sampler(sample_indexed_dataset: IndexedP
     batches_wrapped = list(loader_wrapped)
     assert len(batches_wrapped) == 10
 
+    # Test wrapped dataset with .data attribute (e.g. SIDMapDataset)
+    class WrappedDataDataset:
+        def __init__(self, inner):
+            self.data = inner
+        def __len__(self):
+            return len(self.data)
+        def __getitem__(self, idx):
+            return self.data[idx]
+
+    wrapped_data = WrappedDataDataset(ds)
+    loader_wrapped_data = DataLoader(wrapped_data, batch_size=10, shuffle=True, seed=42, num_workers=2)
+    assert isinstance(loader_wrapped_data.sampler, BlockShuffledSampler)
+    batches_data = list(loader_wrapped_data)
+    assert len(batches_data) == 10
+    total_data_ids = [int(v) for b in batches_data for v in b["id"]]
+    assert set(total_data_ids) == set(range(100))
+
+
+def test_distributed_sampler_with_row_groups(sample_indexed_dataset: IndexedParquetDataset) -> None:
+    """Verify DistributedSampler preserves BlockShuffledSampler row-group locality when shuffle=True."""
+    from parquet_dataset_loader.dataloader import DistributedSampler
+
+    ds = sample_indexed_dataset
+    sampler_r0 = DistributedSampler(ds, num_replicas=2, rank=0, shuffle=True, seed=42)
+    sampler_r1 = DistributedSampler(ds, num_replicas=2, rank=1, shuffle=True, seed=42)
+
+    indices_r0 = list(sampler_r0)
+    indices_r1 = list(sampler_r1)
+
+    assert len(indices_r0) == 50
+    assert len(indices_r1) == 50
+    assert set(indices_r0).isdisjoint(set(indices_r1))
+    assert set(indices_r0) | set(indices_r1) == set(range(100))
+
+
 
