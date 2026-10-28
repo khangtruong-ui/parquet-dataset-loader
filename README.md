@@ -504,6 +504,7 @@ loader.benchmark(num_batches=50)
 | **Worker Execution** | Fork-based multiprocessing (prone to socket deadlocks) | **Thread or Process workers** (`worker_type="thread"`, zero pickling overhead, thread-isolated HTTP sessions & pools) |
 | **Batch Retrieval** | Sample-by-sample ($N \times$ table slices) | **Vectorized contiguous slicing** ($10\times$–$50\times$ faster) |
 | **Collation Robustness**| Crashes on `None`, variable lengths, raw bytes | **Bug-free `default_collate`** (converts tensors safely, preserves lists) |
+| **Shuffling Locality** | Random sample permutation (causes 100% cache misses) | **`BlockShuffledSampler`** (preserves row-group and file locality; automatically detects wrapped datasets via `.data`, `.pdl_dataset`, or `.parquet_dataset`) |
 | **Clean Termination** | Lingering worker processes on `break` | **Guaranteed zero hangs or zombie processes** |
 | **Speed Benchmarking** | Manual boilerplate required | **`loader.benchmark(num_batches=50)`** |
 | **Bottleneck Profiling**| Requires external profiling tools | **`loader.view_bottleneck()`** (debug mode only) |
