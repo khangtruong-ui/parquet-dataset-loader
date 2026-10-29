@@ -72,7 +72,7 @@ def resolve_hf_token(token: Optional[Union[bool, str]] = None) -> Optional[str]:
 def create_retry_session(
     retries: int = 4,
     backoff_factor: float = 0.5,
-    status_forcelist: Sequence[int] = (429, 500, 502, 503, 504),
+    status_forcelist: Sequence[int] = (500, 502, 503, 504),
 ) -> requests.Session:
     """Create a requests.Session with exponential backoff retries.
 

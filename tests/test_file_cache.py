@@ -274,3 +274,163 @@ def test_block_shuffled_sampler_file_locality(temp_cache_dir: str) -> None:
     # Because file locality is preserved, each file is entered exactly once!
     assert len(file_visited) == 3
     assert set(file_visited) == {0, 1, 2}
+
+
+def test_file_cache_save_to_disk_preserves_consumed_files(temp_cache_dir: str) -> None:
+    """Verify that when save_to_disk=True, consumed files are NEVER removed from disk."""
+    source_dir = os.path.join(temp_cache_dir, "source")
+    cache_store_dir = os.path.join(temp_cache_dir, "store")
+    os.makedirs(source_dir, exist_ok=True)
+
+    f1 = create_sample_parquet(os.path.join(source_dir, "file1.parquet"), 10)
+    f2 = create_sample_parquet(os.path.join(source_dir, "file2.parquet"), 10)
+    f3 = create_sample_parquet(os.path.join(source_dir, "file3.parquet"), 10)
+
+    # Initialize cache with save_to_disk=True and max_cached_files=2
+    cache = FileCache(cache_dir=cache_store_dir, max_cached_files=2, save_to_disk=True)
+
+    def mock_download(url: str, target: str) -> str:
+        fname = os.path.basename(url)
+        shutil.copy2(os.path.join(source_dir, fname), target)
+        return target
+
+    cache._download_file = mock_download
+
+    u1 = "https://example.com/file1.parquet"
+    u2 = "https://example.com/file2.parquet"
+    u3 = "https://example.com/file3.parquet"
+
+    p1 = cache.get_or_download(u1)
+    assert os.path.exists(p1)
+    assert cache.unconsumed_files_count == 1
+    assert not cache.is_consumed(u1)
+
+    # Consumer finishes with file 1 and marks it consumed
+    cache.mark_consumed(u1)
+    assert cache.is_consumed(u1)
+    # When save_to_disk is True, file 1 is STILL THERE on disk!
+    assert os.path.exists(p1)
+    # But it is no longer counted in unconsumed waiting for consumption
+    assert cache.unconsumed_files_count == 0
+
+    p2 = cache.get_or_download(u2)
+    p3 = cache.get_or_download(u3)
+
+    # All three files are still present on disk because save_to_disk=True!
+    assert os.path.exists(p1)
+    assert os.path.exists(p2)
+    assert os.path.exists(p3)
+    assert cache.cached_files_count == 3
+    cache.close()
+
+
+def test_file_cache_waiting_for_consumption_bounding(temp_cache_dir: str) -> None:
+    """Verify that max_cache_gb/max_cache_bytes bounds unconsumed cache waiting for consumption."""
+    source_dir = os.path.join(temp_cache_dir, "source")
+    cache_store_dir = os.path.join(temp_cache_dir, "store")
+    os.makedirs(source_dir, exist_ok=True)
+
+    f1 = create_sample_parquet(os.path.join(source_dir, "file1.parquet"), 20)
+    f2 = create_sample_parquet(os.path.join(source_dir, "file2.parquet"), 20)
+    f3 = create_sample_parquet(os.path.join(source_dir, "file3.parquet"), 20)
+    f1_size = os.path.getsize(f1)
+
+    # Set byte budget waiting for consumption to fit exactly 1 file
+    cache = FileCache(
+        cache_dir=cache_store_dir,
+        max_cache_bytes=f1_size,
+        save_to_disk=True,
+    )
+
+    def mock_download(url: str, target: str) -> str:
+        fname = os.path.basename(url)
+        shutil.copy2(os.path.join(source_dir, fname), target)
+        return target
+
+    cache._download_file = mock_download
+
+    u1 = "https://example.com/file1.parquet"
+    u2 = "https://example.com/file2.parquet"
+    u3 = "https://example.com/file3.parquet"
+
+    p1 = cache.get_or_download(u1)
+    assert cache.unconsumed_size_bytes == f1_size
+
+    # Attempting to prefetch u2 and u3: should stop because unconsumed budget is reached
+    cache.prefetch([u2, u3])
+    # Give any scheduled task time to run if scheduled
+    time.sleep(0.05)
+
+    p2_path = cache._url_to_path(u2)
+    # u2 should not have been prefetched because unconsumed budget is already full
+    assert not os.path.exists(p2_path)
+
+    # Once u1 is consumed:
+    cache.mark_consumed(u1)
+    assert cache.unconsumed_size_bytes == 0
+
+    # Now prefetch u2 can proceed
+    cache.prefetch([u2])
+    time.sleep(0.05)
+    assert os.path.exists(p2_path)
+
+    # Both p1 (consumed) and p2 (waiting for consumption) are on disk
+    assert os.path.exists(p1)
+    assert os.path.exists(p2_path)
+    cache.close()
+
+
+def test_file_cache_save_to_disk_false_cleans_consumed_files(temp_cache_dir: str) -> None:
+    """Verify that when save_to_disk=False, consumed files are evicted to free disk space."""
+    source_dir = os.path.join(temp_cache_dir, "source")
+    cache_store_dir = os.path.join(temp_cache_dir, "store")
+    os.makedirs(source_dir, exist_ok=True)
+
+    f1 = create_sample_parquet(os.path.join(source_dir, "file1.parquet"), 10)
+    cache = FileCache(cache_dir=cache_store_dir, save_to_disk=False)
+
+    def mock_download(url: str, target: str) -> str:
+        fname = os.path.basename(url)
+        shutil.copy2(os.path.join(source_dir, fname), target)
+        return target
+
+    cache._download_file = mock_download
+    u1 = "https://example.com/file1.parquet"
+
+    p1 = cache.get_or_download(u1)
+    assert os.path.exists(p1)
+
+    # Mark consumed while active ref exists
+    cache.acquire_file(u1)
+    cache.mark_consumed(u1)
+    # Still exists while active handle is held
+    assert os.path.exists(p1)
+
+    # Release active handle -> should be evicted immediately because save_to_disk=False
+    cache.release_file(u1)
+    assert not os.path.exists(p1)
+    assert cache.cached_files_count == 0
+    cache.close()
+
+
+def test_rate_limit_429_raises_immediately_not_suppressed(temp_cache_dir: str) -> None:
+    """Verify that HTTP 429 Too Many Requests raises RateLimitError immediately without suppress/retry."""
+    from unittest.mock import MagicMock
+    from parquet_dataset_loader.exceptions import RateLimitError
+    from parquet_dataset_loader.reader import download_single_file
+
+    mock_sess = MagicMock()
+    mock_resp_429 = MagicMock()
+    mock_resp_429.status_code = 429
+    mock_resp_429.headers = {"Retry-After": "60"}
+    mock_sess.head.return_value = mock_resp_429
+
+    url = "https://huggingface.co/api/datasets/test/data.parquet"
+    target = os.path.join(temp_cache_dir, "target.parquet")
+
+    # download_single_file should raise RateLimitError immediately on 429
+    with pytest.raises(RateLimitError):
+        download_single_file(url, target, session=mock_sess, max_retries=5)
+
+    # sess.head should only have been called ONCE (not retried 5 times!)
+    assert mock_sess.head.call_count == 1

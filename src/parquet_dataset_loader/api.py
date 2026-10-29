@@ -282,16 +282,27 @@ def load_dataset(
         has_remote = any(u.startswith(("http://", "https://")) for u in file_list)
         should_cache_files = (
             cache_files is True
-            or (cache_files is None and (max_cached_files is not None or max_cache_gb is not None))
+            or (
+                cache_files is None
+                and (max_cached_files is not None or max_cache_gb is not None or bool(save_to_disk))
+            )
         )
         if should_cache_files and has_remote:
-            file_cache_dir = os.path.join(resolved_cache_dir, "file_cache", safe_repo_name, s)
-            eff_max_files = max_cached_files if max_cached_files is not None else 4
+            if isinstance(save_to_disk, str):
+                file_cache_dir = os.path.join(os.path.abspath(os.path.expanduser(save_to_disk)), "files", s)
+            else:
+                file_cache_dir = os.path.join(resolved_cache_dir, "file_cache", safe_repo_name, s)
+            eff_max_files = (
+                max_cached_files
+                if max_cached_files is not None
+                else (None if max_cache_gb is not None else 4)
+            )
             f_cache = FileCache(
                 cache_dir=file_cache_dir,
                 max_cached_files=eff_max_files,
                 max_cache_gb=max_cache_gb,
                 token=token_for_children,
+                save_to_disk=bool(save_to_disk),
             )
             f_cache.set_file_sequence(file_list)
 

@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-10-29
+
+### Added
+- **Consumption-Bounded Disk Cache (`max_cache_gb` / `max_cache_bytes`)**:
+  - Clarified and refined `max_cache_gb`: it defines the maximum total size of downloaded files **waiting for consumption**. Prefetching pauses when unconsumed cache size meets this limit.
+  - Added consumption tracking in `FileCache` via `mark_consumed()`, `is_consumed()`, `unconsumed_size_bytes`, `unconsumed_size_gb`, and `reset_consumption()`.
+  - Added `mark_file_consumed()` and `reset_consumption()` to `IndexedParquetDataset` and automatic epoch consumption resets to `DataLoader.set_epoch()`.
+- **Preserve Consumed Files when `save_to_disk=True`**:
+  - When `save_to_disk=True`, files that have been consumed remain permanently on disk ("still there, not removed"), progressively building the complete local archive without premature LRU deletion.
+  - When `save_to_disk=False`, consumed files are safely evicted from disk once closed, keeping disk usage bounded.
+- **Fail-Fast HTTP 429 Too Many Requests**:
+  - `RateLimitError` is raised immediately on HTTP 429 responses without suppression, exponential backoff stalls, or masking with long sleep loops.
+  - Removed 429 from `create_retry_session` status forcelist.
+  - Avoids 429 rate limiting entirely via forward whole-file caching (`cache_files=True`).
+- **FileCache URL Release Fix**:
+  - `RowGroupReader` properly resolves local memory-mapped file paths back to canonical URLs before invoking `release_file()`, preventing active reference leaks.
+
 ## [0.4.2] - 2026-10-28
 
 ### Added

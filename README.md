@@ -434,25 +434,29 @@ Authentication headers (`Authorization: Bearer <token>`) are automatically appli
 - Concurrent HTTP Range requests made by `fsspec` when streaming row groups.
 - Direct downloads and background prefetching workers.
 
-### 14. Forward File Caching & Bounded Disk Windows (`cache_files`, `max_cached_files`, `max_cache_gb`)
+### 14. Forward File Caching & Bounded Waiting-for-Consumption Windows (`cache_files`, `max_cached_files`, `max_cache_gb`)
 
 When streaming large multi-file datasets (e.g. 62 GB across 62 files) with many workers, making continuous HTTP range requests directly over the network can result in socket flooding or Hugging Face HTTP `429 Too Many Requests` rate limiting.
 
-With forward file caching enabled, `parquet-dataset-loader` maintains a strictly bounded local sliding window of remote Parquet files on disk:
+With forward file caching enabled, `parquet-dataset-loader` maintains a strictly bounded local window of remote Parquet files on disk:
 - When a remote file is reached, it is downloaded locally and opened via memory mapping (`memory_map=True`), giving all worker threads zero-network, high-throughput access.
 - Upcoming files in the sequence are prefetched forward in the background while workers process current batches.
-- Once disk usage exceeds `max_cached_files` or `max_cache_gb`, older unreferenced files are automatically evicted and removed from disk.
+- `max_cache_gb` specifies the **maximum cache size waiting for consumption**: prefetching automatically pauses when the size of downloaded, unconsumed files reaches `max_cache_gb` (or `max_cached_files`).
+- Once a file is consumed by the reader/trainer:
+  - If `save_to_disk=True` (or a directory path), the file is **still there, not removed from disk**, progressively building the permanent local dataset archive without redundant re-downloads.
+  - If `save_to_disk=False`, the consumed file is safely evicted from disk once closed, keeping disk usage bounded.
+- If an HTTP `429 Too Many Requests` error occurs, it is raised immediately (not suppressed or masked with long sleep loops) so callers are alerted directly while forward caching prevents rate limits from occurring in the first place.
 
 ```python
 import parquet_dataset_loader as pdl
 
-# Forward-cache up to 4 remote Parquet files simultaneously on local disk (~4-6 GB window)
+# Forward-cache with bounded 6.0 GB waiting for consumption; files stay on disk when save_to_disk=True
 ds = pdl.load_dataset(
     "KhangTruong/COCO-inpainted",
     split="train",
     streaming=True,
     cache_files=True,
-    max_cached_files=4,
+    save_to_disk=True,
     max_cache_gb=6.0,
 )
 ```
@@ -742,7 +746,7 @@ pdl-kill --quiet
 | `manage` | `bool` | `True` | Whether to register instance with `DatasetManager` for global tracking and coordinated shutdown. |
 | `cache_files` | `bool` / `None` | `False` | When `True`, enables on-disk LRU file caching of remote Parquet files to eliminate HTTP socket thrashing and 429 rate limits. |
 | `max_cached_files` | `int` / `None` | `4` (if caching) | Maximum number of remote Parquet files forward-cached on local disk simultaneously. |
-| `max_cache_gb` | `float` / `None` | `None` | Maximum disk space in gigabytes allowed for cached Parquet files before evicting least recently used files. |
+| `max_cache_gb` | `float` / `None` | `None` | Maximum cache size in gigabytes waiting for consumption. Once consumed, files remain on disk if `save_to_disk=True`. |
 
 ### `load_from_disk(...)`
 
