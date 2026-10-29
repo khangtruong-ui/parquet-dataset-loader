@@ -809,6 +809,25 @@ class IndexedParquetDataset(collections.abc.Sequence):
         if self.background_downloader is not None:
             self.background_downloader.stop()
 
+    def mark_file_consumed(self, file_index_or_url: Union[int, str]) -> None:
+        """Mark a dataset file as consumed in the underlying FileCache.
+
+        If save_to_disk is True, the consumed file remains permanently on disk.
+        If save_to_disk is False, the consumed file is evicted and deleted.
+        """
+        if self.file_cache is None:
+            return
+        if isinstance(file_index_or_url, int):
+            if 0 <= file_index_or_url < len(self.file_list):
+                self.file_cache.mark_consumed(self.file_list[file_index_or_url])
+        else:
+            self.file_cache.mark_consumed(str(file_index_or_url))
+
+    def reset_consumption(self) -> None:
+        """Reset consumed files set in FileCache (useful across multi-epoch iterations)."""
+        if self.file_cache is not None:
+            self.file_cache.reset_consumption()
+
     def close(self) -> None:
         """Stop any background downloader and close open reader handles."""
         if self.is_closed:

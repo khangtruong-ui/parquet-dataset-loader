@@ -808,6 +808,15 @@ class DataLoader:
             self.batch_sampler.set_epoch(epoch)
         if hasattr(self.dataset, "set_epoch"):
             self.dataset.set_epoch(epoch)
+        for obj in (
+            self.dataset,
+            getattr(self.dataset, "pdl_dataset", None),
+            getattr(self.dataset, "data", None),
+            getattr(self.dataset, "parquet_dataset", None),
+            getattr(self.dataset, "dataset", None),
+        ):
+            if obj is not None and hasattr(obj, "reset_consumption"):
+                obj.reset_consumption()
 
     def enable_debug(self) -> None:
         """Enable fine-grained bottleneck profiling for subsequent runs."""
