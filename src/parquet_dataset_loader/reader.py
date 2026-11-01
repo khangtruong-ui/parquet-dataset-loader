@@ -6,6 +6,7 @@ range requests or local disk, applying column projection, and managing connectio
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import threading
@@ -227,6 +228,19 @@ class RowGroupReader:
                 if is_rate_limit:
                     raise RateLimitError(orig_url) from exc
 
+                if not is_remote and self.file_cache is not None:
+                    # Corrupted/invalid local cached file. Evict from cache and fall back to remote stream or retry
+                    logger.warning(
+                        "⚠️ Error opening cached Parquet file '%s': %s. Evicting from FileCache and falling back...",
+                        file_url_or_path,
+                        exc,
+                    )
+                    rel_url = self._path_to_url.pop(file_url_or_path, file_url_or_path)
+                    self.file_cache.evict(file_url_or_path)
+                    self.file_cache.evict(rel_url)
+                    file_url_or_path = orig_url
+                    is_remote = orig_url.startswith(("http://", "https://"))
+
                 if is_remote and attempt < attempts - 1 and "cannot schedule new futures" not in str(exc).lower():
                     delay = min(self.max_retry_delay, self.retry_delay * (2 ** attempt))
                     logger.warning(
@@ -301,6 +315,8 @@ class RowGroupReader:
                 last_error = e
                 # Evict the potentially severed/corrupted file handle from pool
                 self._evict_file(file_url)
+                if self.file_cache is not None:
+                    self.file_cache.evict(file_url)
                 is_rate_limit = "429" in str(e) or "too many requests" in str(e).lower()
                 if is_rate_limit:
                     raise RateLimitError(file_url) from e
@@ -405,7 +421,8 @@ def download_single_file(
     """Download a single remote Parquet file with resume and atomic write.
 
     Handles transient network errors, socket disconnects, and HTTP 429 rate limits
-    with exponential backoff and Retry-After awareness.
+    with exponential backoff and Retry-After awareness. Fully process-safe and
+    thread-safe across multi-worker and multi-GPU distributed environments.
 
     Args:
         url: File URL to download.
@@ -419,7 +436,6 @@ def download_single_file(
         The target path.
     """
     os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
-    temp_path = f"{target_path}.part"
 
     sess = session or create_retry_session()
     auth_token = resolve_hf_token(token)
@@ -427,61 +443,98 @@ def download_single_file(
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
 
-    # Check remote size with retry on transient network errors, but let RateLimitError (429) raise immediately
-    remote_size = 0
-    for attempt in range(max_retries):
-        try:
-            head = sess.head(url, headers=headers, allow_redirects=True, timeout=15)
-            if head.status_code == 429:
-                raise RateLimitError(url)
-            head.raise_for_status()
-            remote_size = int(head.headers.get("content-length", 0))
-            break
-        except RateLimitError:
-            raise
-        except requests.RequestException as e:
-            if "429" in str(e) or (hasattr(e, "response") and getattr(e.response, "status_code", None) == 429):
-                raise RateLimitError(url) from e
-            if attempt == max_retries - 1:
-                raise
-            time.sleep(min(30.0, 1.5 * (2 ** attempt)))
+    # Process-safe file lock on target file to prevent multi-GPU download races
+    lock_path = f"{target_path}.lock"
+    try:
+        from filelock import FileLock
+        has_filelock = True
+    except ImportError:
+        has_filelock = False
 
-    if os.path.exists(target_path) and remote_size > 0:
-        if os.path.getsize(target_path) == remote_size:
-            return target_path  # Already downloaded completely
+    lock_ctx = FileLock(lock_path, timeout=600) if has_filelock else contextlib.nullcontext()
 
-    resume_offset = 0
-    mode = "wb"
-    if os.path.exists(temp_path):
-        resume_offset = os.path.getsize(temp_path)
-        if 0 < resume_offset < remote_size:
-            headers["Range"] = f"bytes={resume_offset}-"
-            mode = "ab"
-        else:
-            resume_offset = 0
-
-    for attempt in range(max_retries):
-        try:
-            with sess.get(url, headers=headers, stream=True, timeout=30) as resp:
-                if resp.status_code == 429:
+    with lock_ctx:
+        # Check remote size with retry on transient network errors, but let RateLimitError (429) raise immediately
+        remote_size = 0
+        for attempt in range(max_retries):
+            try:
+                head = sess.head(url, headers=headers, allow_redirects=True, timeout=15)
+                if head.status_code == 429:
                     raise RateLimitError(url)
-                resp.raise_for_status()
-                with open(temp_path, mode) as f:
-                    for chunk in resp.iter_content(chunk_size=chunk_size):
-                        if chunk:
-                            f.write(chunk)
-            break
-        except RateLimitError:
-            raise
-        except requests.RequestException as e:
-            if "429" in str(e) or (hasattr(e, "response") and getattr(e.response, "status_code", None) == 429):
-                raise RateLimitError(url) from e
-            if attempt == max_retries - 1:
+                head.raise_for_status()
+                remote_size = int(head.headers.get("content-length", 0))
+                break
+            except RateLimitError:
                 raise
-            time.sleep(min(30.0, 1.5 * (2 ** attempt)))
+            except requests.RequestException as e:
+                if "429" in str(e) or (hasattr(e, "response") and getattr(e.response, "status_code", None) == 429):
+                    raise RateLimitError(url) from e
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(min(30.0, 1.5 * (2 ** attempt)))
 
-    os.replace(temp_path, target_path)
-    return target_path
+        # If another process or thread already downloaded the file while waiting for lock:
+        if os.path.exists(target_path):
+            cur_sz = os.path.getsize(target_path)
+            if (remote_size > 0 and cur_sz == remote_size) or (remote_size == 0 and cur_sz > 4):
+                try:
+                    with open(target_path, "rb") as tf:
+                        tf.seek(-4, os.SEEK_END)
+                        if tf.read(4) == b"PAR1":
+                            return target_path
+                except Exception:
+                    pass
+
+        # Use unique temporary path per process and thread to avoid any filesystem collision
+        temp_path = f"{target_path}.part.{os.getpid()}_{threading.get_ident()}_{time.time_ns()}"
+        try:
+            download_headers = dict(headers)
+            for attempt in range(max_retries):
+                try:
+                    with sess.get(url, headers=download_headers, stream=True, timeout=30) as resp:
+                        if resp.status_code == 429:
+                            raise RateLimitError(url)
+                        resp.raise_for_status()
+                        with open(temp_path, "wb") as f:
+                            for chunk in resp.iter_content(chunk_size=chunk_size):
+                                if chunk:
+                                    f.write(chunk)
+                    break
+                except RateLimitError:
+                    raise
+                except requests.RequestException as e:
+                    if "429" in str(e) or (hasattr(e, "response") and getattr(e.response, "status_code", None) == 429):
+                        raise RateLimitError(url) from e
+                    if attempt == max_retries - 1:
+                        raise
+                    time.sleep(min(30.0, 1.5 * (2 ** attempt)))
+
+            # Validate completed download before replacing target
+            if os.path.exists(temp_path):
+                dl_sz = os.path.getsize(temp_path)
+                if remote_size > 0 and dl_sz != remote_size:
+                    raise CorruptParquetError(
+                        url,
+                        f"Downloaded size ({dl_sz}) does not match expected remote size ({remote_size}).",
+                    )
+                if dl_sz >= 4:
+                    with open(temp_path, "rb") as tf:
+                        tf.seek(-4, os.SEEK_END)
+                        magic = tf.read(4)
+                        if magic != b"PAR1":
+                            raise CorruptParquetError(
+                                url,
+                                f"Downloaded file '{temp_path}' does not end with Parquet magic bytes PAR1 (got {magic!r}).",
+                            )
+
+            os.replace(temp_path, target_path)
+            return target_path
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
 
 def download_parquet_files(

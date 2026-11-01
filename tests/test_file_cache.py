@@ -434,3 +434,103 @@ def test_rate_limit_429_raises_immediately_not_suppressed(temp_cache_dir: str) -
 
     # sess.head should only have been called ONCE (not retried 5 times!)
     assert mock_sess.head.call_count == 1
+
+
+def test_file_cache_evict(temp_cache_dir: str) -> None:
+    """Verify that FileCache.evict successfully deletes files on disk and clears metadata."""
+    cache = FileCache(cache_dir=temp_cache_dir)
+    url = "https://example.com/test_file.parquet"
+    target = cache._url_to_path(url)
+    create_sample_parquet(target, num_rows=10)
+    assert os.path.exists(target)
+
+    # Put into tracking
+    cache._access_times[url] = time.time()
+    cache._consumed_files.add(url)
+    cache._active_refs[url] = 1
+
+    # Also create a stray .lock file
+    lock_file = f"{target}.lock"
+    with open(lock_file, "w") as f:
+        f.write("lock")
+
+    evicted = cache.evict(target)
+    assert evicted is True
+    assert not os.path.exists(target)
+    assert not os.path.exists(lock_file)
+    assert url not in cache._access_times
+    assert url not in cache._consumed_files
+    assert url not in cache._active_refs
+
+    # Test evicting by URL directly
+    target2 = cache._url_to_path("https://example.com/file2.parquet")
+    create_sample_parquet(target2, num_rows=10)
+    url2 = "https://example.com/file2.parquet"
+    cache._access_times[url2] = time.time()
+    assert cache.evict(url2) is True
+    assert not os.path.exists(target2)
+    assert url2 not in cache._access_times
+
+    cache.close()
+
+
+def test_download_single_file_concurrent_race(temp_cache_dir: str) -> None:
+    """Verify that concurrent downloads from multiple threads/workers do not collide on .part or crash."""
+    from unittest.mock import MagicMock
+    import concurrent.futures
+    from parquet_dataset_loader.reader import download_single_file
+
+    sample_src = os.path.join(temp_cache_dir, "source.parquet")
+    create_sample_parquet(sample_src, num_rows=50)
+    with open(sample_src, "rb") as f:
+        file_bytes = f.read()
+
+    file_size = len(file_bytes)
+    target_path = os.path.join(temp_cache_dir, "downloaded.parquet")
+
+    def mock_head(*args, **kwargs):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"content-length": str(file_size)}
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    def mock_get(*args, **kwargs):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"content-length": str(file_size)}
+        resp.raise_for_status = MagicMock()
+        # Simulate slight network delay to expose any race conditions
+        def iter_content(chunk_size=1024):
+            time.sleep(0.01)
+            yield file_bytes
+        resp.iter_content = iter_content
+        resp.__enter__ = MagicMock(return_value=resp)
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    mock_sess = MagicMock()
+    mock_sess.head.side_effect = mock_head
+    mock_sess.get.side_effect = mock_get
+
+    def download_task(thread_id: int):
+        return download_single_file(
+            url="https://example.com/test_race.parquet",
+            target_path=target_path,
+            session=mock_sess,
+        )
+
+    # Run 8 concurrent workers racing on the exact same target path
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(download_task, i) for i in range(8)]
+        results = [f.result() for f in futures]
+
+    assert len(results) == 8
+    assert all(r == target_path for r in results)
+    assert os.path.exists(target_path)
+    assert os.path.getsize(target_path) == file_size
+    # Verify Parquet footer magic bytes
+    with open(target_path, "rb") as f:
+        f.seek(-4, os.SEEK_END)
+        assert f.read(4) == b"PAR1"
+

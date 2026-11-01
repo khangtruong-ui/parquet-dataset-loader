@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-11-01
+
+### Fixed
+- **Multi-Process and Multi-GPU Download Race Prevention**:
+  - Implemented cross-process file locks via `filelock.FileLock` on `f"{target_path}.lock"` during `download_single_file()`, preventing concurrent workers or DDP ranks from racing to write or rename the same file.
+  - Utilizes per-process and per-thread unique temporary download paths (`.part.{pid}_{thread_ident}_{timestamp}`) to eliminate `[Errno 2] No such file or directory: *.parquet.part -> *.parquet` errors.
+  - Added strict file validation (verifying remote content-length and checking for trailing `PAR1` Parquet magic bytes) prior to `os.replace()`, ensuring partial or 0-byte files are never committed to cache.
+- **Corrupt File Eviction & Safe Recovery**:
+  - Added `evict(file_url_or_path)` method to `FileCache` to safely purge corrupted or invalid Parquet files from local disk, locks, and LRU tracking structures.
+  - Updated `_discover_existing_files()` in `FileCache` to preserve temporary files newer than 1 hour, preventing one worker process from prematurely unlinking an in-progress download of another worker process.
+  - Integrated corrupt file eviction in `RowGroupReader._get_parquet_file()` and `read_row_group()` to automatically discard damaged local files and transparently fall back to remote HTTP streaming or clean re-download.
+
 ## [0.4.3] - 2026-10-29
 
 ### Added
