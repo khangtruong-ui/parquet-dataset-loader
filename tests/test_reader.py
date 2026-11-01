@@ -217,4 +217,32 @@ def test_row_group_reader_multithreaded_concurrency(temp_dir: str) -> None:
         reader.close()
 
 
+def test_row_group_reader_corrupt_cached_file_eviction(temp_dir: str) -> None:
+    """Verify RowGroupReader evicts corrupted cached files when encountered."""
+    from parquet_dataset_loader.cache import FileCache
+
+    cache = FileCache(cache_dir=temp_dir)
+    reader = RowGroupReader(file_cache=cache)
+
+    corrupt_cached = os.path.join(temp_dir, "corrupt.parquet")
+    with open(corrupt_cached, "wb") as f:
+        f.write(b"NOT_A_PARQUET_FILE_JUST_TRASH_BYTES")
+
+    orig_url = "https://example.com/data.parquet"
+    reader._path_to_url[corrupt_cached] = orig_url
+    cache._access_times[orig_url] = 12345.0
+
+    # Reading should detect invalid parquet, trigger evict from cache, and attempt fallback
+    # Since remote URL is mock, it will raise CorruptParquetError or ConnectionError,
+    # but the corrupt file on disk must be evicted!
+    with pytest.raises(Exception):
+        reader._get_parquet_file(corrupt_cached)
+
+    assert not os.path.exists(corrupt_cached)
+    assert orig_url not in cache._access_times
+    reader.close()
+    cache.close()
+
+
+
 

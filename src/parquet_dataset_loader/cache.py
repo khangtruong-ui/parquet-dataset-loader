@@ -309,11 +309,15 @@ class FileCache:
             return
         with self._lock:
             try:
+                now = time.time()
                 for fname in os.listdir(self.cache_dir):
                     fpath = os.path.join(self.cache_dir, fname)
-                    if fname.endswith((".part", ".tmp")):
+                    if fname.endswith((".part", ".tmp")) or ".part." in fname:
                         try:
-                            os.remove(fpath)
+                            # Only clean temp files older than 1 hour to prevent deleting
+                            # in-progress downloads from other concurrent processes
+                            if now - os.path.getmtime(fpath) > 3600:
+                                os.remove(fpath)
                         except OSError:
                             pass
                     elif fname.endswith((".parquet", ".pq")):
@@ -383,6 +387,56 @@ class FileCache:
             logger.debug("Removed consumed file '%s' from disk (save_to_disk=False).", path)
         except OSError as e:
             logger.warning("Could not remove consumed file '%s': %s", path, e)
+
+    def evict(self, file_url_or_path: str) -> bool:
+        """Evict a specific file from the cache, removing it from disk and tracking.
+
+        Useful when a file is found to be corrupt, truncated, or invalid, allowing
+        subsequent reads to fall back to streaming or safe re-download.
+
+        Args:
+            file_url_or_path: Remote URL or local path of the cached file.
+
+        Returns:
+            True if a file on disk was removed, False otherwise.
+        """
+        path = self._url_to_path(file_url_or_path) if file_url_or_path.startswith(("http://", "https://")) else file_url_or_path
+        with self._lock:
+            removed = False
+            for target_file in {path, file_url_or_path}:
+                if not target_file.startswith(("http://", "https://")):
+                    try:
+                        if os.path.exists(target_file):
+                            os.remove(target_file)
+                            removed = True
+                    except OSError as e:
+                        logger.warning("Could not evict cached file '%s': %s", target_file, e)
+
+                    lock_path = f"{target_file}.lock"
+                    if os.path.exists(lock_path):
+                        try:
+                            os.remove(lock_path)
+                        except OSError:
+                            pass
+
+            # Evict from tracking structures
+            keys_to_remove = set()
+            for k in list(self._access_times.keys()):
+                if k == file_url_or_path or k == path:
+                    keys_to_remove.add(k)
+                elif k.startswith(("http://", "https://")):
+                    try:
+                        if self._url_to_path(k) == path:
+                            keys_to_remove.add(k)
+                    except Exception:
+                        pass
+
+            for k in keys_to_remove | {file_url_or_path, path}:
+                self._access_times.pop(k, None)
+                self._consumed_files.discard(k)
+                self._active_refs.pop(k, None)
+
+            return removed
 
     def set_file_sequence(self, file_urls: Sequence[str]) -> None:
         """Set the expected sequence of files to enable forward prefetching."""
