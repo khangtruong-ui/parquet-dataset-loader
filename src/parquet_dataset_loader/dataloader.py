@@ -617,7 +617,8 @@ class DataLoader:
             if None or -1. Set to 0 for in-process synchronous iteration.
         collate_fn: Function to collate samples into batches (defaults to robust `default_collate`).
         drop_last: If True, drop the last incomplete batch (default: False).
-        timeout: Timeout in seconds for waiting on batch completion (default: 60.0).
+        timeout: Timeout in seconds for waiting on batch completion (default: 300.0).
+            Set to 0, negative, or None to disable timeout and wait indefinitely while workers are alive.
         worker_type: Worker concurrency type: "auto", "thread", or "process".
             "auto" uses thread workers which eliminate fork deadlocks and IPC overhead.
         prefetch_factor: Number of batches loaded in advance per worker (default: 2).
@@ -641,7 +642,7 @@ class DataLoader:
         num_workers: Optional[int] = None,
         collate_fn: Optional[Callable[[Any], Any]] = None,
         drop_last: bool = False,
-        timeout: float = 60.0,
+        timeout: Optional[float] = 300.0,
         worker_type: str = "auto",
         prefetch_factor: int = 2,
         pin_memory: bool = False,
@@ -663,7 +664,7 @@ class DataLoader:
         self.dataset = dataset
         self.batch_size = max(1, int(batch_size))
         self.drop_last = bool(drop_last)
-        self.timeout = float(timeout)
+        self.timeout = float(timeout) if timeout is not None else 0.0
         self.prefetch_factor = max(1, int(prefetch_factor))
         self.pin_memory = bool(pin_memory)
         self.debug = bool(debug)
@@ -1114,7 +1115,8 @@ class DataLoader:
             while not shutdown_event.is_set():
                 t_start = time.perf_counter()
                 try:
-                    item = q.get(timeout=self.timeout)
+                    q_timeout = self.timeout if self.timeout > 0 else None
+                    item = q.get(timeout=q_timeout)
                 except queue.Empty:
                     raise TimeoutError(f"DataLoader timed out waiting for streaming batch after {self.timeout:.1f}s.")
 
@@ -1297,11 +1299,15 @@ class DataLoader:
                 if next_batch_idx in reorder_buffer:
                     batch_data, timings = reorder_buffer.pop(next_batch_idx)
                 else:
-                    # Poll result queue with timeout checks
-                    poll_deadline = time.perf_counter() + self.timeout
+                    # Poll result queue with timeout checks (disabled if timeout <= 0)
+                    poll_deadline = (
+                        (time.perf_counter() + self.timeout)
+                        if self.timeout > 0
+                        else None
+                    )
                     got_batch = False
 
-                    while time.perf_counter() < poll_deadline and not shutdown_event.is_set():
+                    while (poll_deadline is None or time.perf_counter() < poll_deadline) and not shutdown_event.is_set():
                         t_wait_start = time.perf_counter()
                         try:
                             item = result_queue.get(timeout=0.2)

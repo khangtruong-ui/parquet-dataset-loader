@@ -507,4 +507,59 @@ def test_distributed_sampler_with_row_groups(sample_indexed_dataset: IndexedParq
     assert set(indices_r0) | set(indices_r1) == set(range(100))
 
 
+def test_dataloader_timeout_configuration(sample_indexed_dataset: IndexedParquetDataset) -> None:
+    """Verify DataLoader default timeout is 300.0s and custom / disabled timeouts are supported."""
+    ds = sample_indexed_dataset
+    # Default timeout
+    loader_default = DataLoader(ds, batch_size=5)
+    assert loader_default.timeout == 300.0
+
+    # Custom timeout
+    loader_custom = DataLoader(ds, batch_size=5, timeout=45.0)
+    assert loader_custom.timeout == 45.0
+
+    # Disabled timeout with 0
+    loader_zero = DataLoader(ds, batch_size=5, timeout=0)
+    assert loader_zero.timeout == 0.0
+
+    # Disabled timeout with None
+    loader_none = DataLoader(ds, batch_size=5, timeout=None)
+    assert loader_none.timeout == 0.0
+
+
+def test_dataloader_timeout_error_raised() -> None:
+    """Verify TimeoutError is raised when workers fail to yield a batch before timeout deadline."""
+    import time
+
+    class StallingDataset:
+        def __len__(self) -> int:
+            return 10
+
+        def __getitem__(self, idx: int) -> Dict[str, Any]:
+            time.sleep(1.0)
+            return {"id": idx}
+
+    loader = DataLoader(StallingDataset(), batch_size=2, num_workers=1, timeout=0.2)
+    with pytest.raises(TimeoutError, match="DataLoader timed out waiting for batch"):
+        list(loader)
+
+
+def test_dataloader_timeout_disabled_no_timeout() -> None:
+    """Verify timeout=0 / None disables timeout so slower I/O batches are not erroneously aborted."""
+    import time
+
+    class SlowDataset:
+        def __len__(self) -> int:
+            return 4
+
+        def __getitem__(self, idx: int) -> Dict[str, Any]:
+            time.sleep(0.1)
+            return {"id": idx}
+
+    loader = DataLoader(SlowDataset(), batch_size=2, num_workers=1, timeout=0)
+    batches = list(loader)
+    assert len(batches) == 2
+
+
+
 

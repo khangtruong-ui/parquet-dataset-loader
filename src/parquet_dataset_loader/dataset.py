@@ -906,7 +906,7 @@ class IndexedParquetDataset(collections.abc.Sequence):
         num_workers: Optional[int] = None,
         collate_fn: Optional[Callable[[Any], Any]] = None,
         drop_last: bool = False,
-        timeout: float = 60.0,
+        timeout: Optional[float] = 300.0,
         worker_type: str = "auto",
         prefetch_factor: int = 2,
         pin_memory: bool = False,

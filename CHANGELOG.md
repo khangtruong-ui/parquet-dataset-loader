@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.5] - 2026-11-04
+
+### Added
+- **Resilient DataLoader Batch Timeout (`timeout=300.0` default / disableable)**:
+  - Raised default `timeout` from 60.0s to 300.0s in `DataLoader` and `to_dataloader()`, preventing spurious timeouts during initial cold-cache multi-gigabyte Parquet file downloads and heavy remote streaming pipelines.
+  - Added support for `timeout=0`, negative values, or `timeout=None` to disable the batch timeout deadline completely and wait indefinitely while workers/feeder threads remain alive, aligning with standard PyTorch `DataLoader(timeout=0)` semantics.
+  - Hardened multi-worker queue polling in both `_iter_multi_worker()` and `_iter_streaming_multi_worker()` against false timeout exceptions.
+
 ## [0.4.4] - 2026-11-01
 
 ### Fixed

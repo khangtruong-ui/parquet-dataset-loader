@@ -513,6 +513,7 @@ loader.benchmark(num_batches=50)
 | **Speed Benchmarking** | Manual boilerplate required | **`loader.benchmark(num_batches=50)`** |
 | **Bottleneck Profiling**| Requires external profiling tools | **`loader.view_bottleneck()`** (debug mode only) |
 | **Health Monitoring** | Silent slowdowns | **Early warnings** on I/O stalls, starvation (>80% wait), empty batches |
+| **Batch Timeout** | Default 0 (infinite wait, freezes on deadlocks) | **Configurable `timeout`** (default 300.0s; supports `timeout=0` or `None` to wait indefinitely while workers are alive) |
 
 ---
 
