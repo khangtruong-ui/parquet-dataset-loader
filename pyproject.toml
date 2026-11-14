@@ -43,6 +43,7 @@ dependencies = [
     "tqdm>=4.60.0",
     "datasets>=2.14.0",
     "filelock>=3.8.0",
+    "aiohttp>=3.9.0"
 ]
 
 [project.optional-dependencies]
