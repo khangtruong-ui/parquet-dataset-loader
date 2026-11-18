@@ -27,6 +27,8 @@ import threading
 import time
 import traceback
 import warnings
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -509,6 +511,24 @@ class _WorkerExceptionWrapper:
 # ============================================================================
 # DataLoader
 # ============================================================================
+
+def _resolve_parquet_dataset(dataset: Any) -> Optional[Any]:
+    """Unwrap dataset wrappers to find an underlying IndexedParquetDataset-like object."""
+    seen: Set[int] = set()
+    cur = dataset
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if hasattr(cur, "reader") and hasattr(cur, "index") and hasattr(getattr(cur, "index", None), "locate_row"):
+            return cur
+        nxt = None
+        for attr in ("pdl_dataset", "data", "parquet_dataset", "dataset"):
+            cand = getattr(cur, attr, None)
+            if cand is not None and id(cand) not in seen:
+                nxt = cand
+                break
+        cur = nxt
+    return None
+
 
 def _fetch_raw_batch_static(dataset: Any, indices: List[int]) -> Any:
     """Fetch raw data for the given indices with vectorized fast-paths."""
@@ -1160,6 +1180,111 @@ class DataLoader:
                     break
             t.join(timeout=1.0)
 
+    def _start_row_group_prefetcher(
+        self,
+        batches_list: List[List[int]],
+        shutdown_event: Any,
+        consumer_state: Dict[str, int],
+        wakeup_event: threading.Event,
+    ) -> Optional[threading.Thread]:
+        """Background lookahead prefetcher for Parquet row groups in thread-worker mode."""
+        if self.worker_type != "thread" or not batches_list:
+            return None
+
+        pdl_ds = _resolve_parquet_dataset(self.dataset)
+        if pdl_ds is None:
+            return None
+
+        reader = getattr(pdl_ds, "reader", None)
+        index = getattr(pdl_ds, "index", None)
+        if reader is None or index is None or not hasattr(reader, "read_row_group"):
+            return None
+
+        memory_cache = getattr(reader, "memory_cache", None)
+        cache_cap = getattr(memory_cache, "max_entries", 0) if memory_cache is not None else 0
+        if cache_cap < 2:
+            return None
+
+        columns = getattr(pdl_ds, "columns", None)
+        indices_map = getattr(pdl_ds, "indices", None)
+        offset = getattr(pdl_ds, "offset", 0)
+        lookahead_rgs = max(1, min(4, cache_cap // 2))
+
+        def _locate_rg(sample_idx: int) -> Optional[Tuple[str, int, int]]:
+            try:
+                global_idx = indices_map[sample_idx] if indices_map is not None else (offset + sample_idx)
+                rg_info, _ = index.locate_row(global_idx)
+                return (rg_info.file_url, rg_info.rg_index, rg_info.file_index)
+            except Exception:
+                return None
+
+        def _prefetch_one(rg_key: Tuple[str, int, int]) -> None:
+            if shutdown_event.is_set():
+                return
+            file_url, rg_index, file_index = rg_key
+            try:
+                reader.read_row_group(
+                    file_url=file_url,
+                    rg_index=rg_index,
+                    columns=columns,
+                    file_index=file_index,
+                )
+            except Exception:
+                # Workers handle retries/errors on actual demand
+                pass
+
+        def _prefetch_loop() -> None:
+            total = len(batches_list)
+            scan_idx = 0
+            # Ordered queue of (rg_key, last_seen_batch_idx)
+            ahead_rgs: deque[Tuple[Tuple[str, int, int], int]] = deque()
+            submitted_keys: Set[Tuple[str, int, int]] = set()
+            max_pool = min(2, lookahead_rgs)
+
+            with ThreadPoolExecutor(max_workers=max_pool, thread_name_prefix="pdl-rg-prefetch") as pool:
+                while not shutdown_event.is_set() and scan_idx < total:
+                    cur_b = consumer_state["batch_idx"]
+                    if scan_idx < cur_b:
+                        scan_idx = cur_b
+
+                    # Drop row groups already passed by the consumer
+                    while ahead_rgs and ahead_rgs[0][1] < cur_b:
+                        old_key, _ = ahead_rgs.popleft()
+                        submitted_keys.discard(old_key)
+
+                    # Discover and prefetch up to lookahead_rgs ahead of consumer
+                    while not shutdown_event.is_set() and scan_idx < total and len(ahead_rgs) < lookahead_rgs + 1:
+                        batch_indices = batches_list[scan_idx]
+                        if batch_indices:
+                            rg_key = _locate_rg(batch_indices[0])
+                            if rg_key is not None:
+                                if ahead_rgs and ahead_rgs[-1][0] == rg_key:
+                                    # Update last_seen_batch_idx for this row group
+                                    ahead_rgs[-1] = (rg_key, scan_idx)
+                                elif rg_key not in submitted_keys:
+                                    ahead_rgs.append((rg_key, scan_idx))
+                                    submitted_keys.add(rg_key)
+                                    # Prefetch if it is ahead of current batch or not yet cached
+                                    if memory_cache is None or memory_cache.get(rg_key[0], rg_key[1], columns) is None:
+                                        pool.submit(_prefetch_one, rg_key)
+                                else:
+                                    # Already submitted earlier; update if it's the tail
+                                    pass
+                        scan_idx += 1
+
+                    if scan_idx >= total:
+                        break
+                    wakeup_event.wait(timeout=0.05)
+                    wakeup_event.clear()
+
+        t = threading.Thread(
+            target=_prefetch_loop,
+            daemon=True,
+            name="pdl-dataloader-rg-prefetcher",
+        )
+        t.start()
+        return t
+
     def _iter_multi_worker(self) -> Iterator[Any]:
         """Multi-worker prefetching with bounded queue and guaranteed clean exit."""
         if not self._is_map:
@@ -1285,6 +1410,15 @@ class DataLoader:
         )
         feeder_thread.start()
 
+        consumer_state: Dict[str, int] = {"batch_idx": 0}
+        prefetch_wakeup = threading.Event()
+        rg_prefetch_thread = self._start_row_group_prefetcher(
+            batches_list=batches_list,
+            shutdown_event=shutdown_event,
+            consumer_state=consumer_state,
+            wakeup_event=prefetch_wakeup,
+        )
+
         # Consumer loop: yield batches in strict sequential order
         next_batch_idx = 0
         reorder_buffer: Dict[int, Tuple[Any, Dict[str, float]]] = {}
@@ -1292,6 +1426,8 @@ class DataLoader:
 
         try:
             while next_batch_idx < total_batches:
+                consumer_state["batch_idx"] = next_batch_idx
+                prefetch_wakeup.set()
                 step_start = time.perf_counter()
                 queue_wait_time = 0.0
 
@@ -1372,6 +1508,7 @@ class DataLoader:
         finally:
             # Guaranteed clean shutdown: signal stop, drain queues, join workers
             shutdown_event.set()
+            prefetch_wakeup.set()
 
             # Drain queues to unblock workers waiting on put()
             try:
@@ -1389,6 +1526,8 @@ class DataLoader:
                 pass
 
             feeder_thread.join(timeout=1.0)
+            if rg_prefetch_thread is not None:
+                rg_prefetch_thread.join(timeout=1.0)
             for w in workers:
                 w.join(timeout=1.0)
                 if hasattr(w, "is_alive") and w.is_alive() and hasattr(w, "terminate"):

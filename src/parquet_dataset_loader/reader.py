@@ -28,6 +28,17 @@ from parquet_dataset_loader.hf_resolver import create_retry_session, resolve_hf_
 logger = logging.getLogger("parquet_dataset_loader.reader")
 
 
+class _InflightRowGroup:
+    """Coordination state for single-flight row group reads across worker threads."""
+
+    __slots__ = ("event", "table", "error")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.table: Optional[pa.Table] = None
+        self.error: Optional[BaseException] = None
+
+
 class RowGroupReader:
     """Reads individual row groups from local or remote Parquet files with caching.
 
@@ -69,6 +80,8 @@ class RowGroupReader:
 
         self._local = threading.local()
         self._lock = threading.Lock()
+        self._inflight_lock = threading.Lock()
+        self._inflight_rgs: Dict[Tuple[str, int, Optional[Tuple[str, ...]]], _InflightRowGroup] = {}
         self._all_active_fps: set = set()
         self._path_to_url: Dict[str, str] = {}
         self._read_rgs_per_file: Dict[str, Set[int]] = defaultdict(set)
@@ -282,101 +295,121 @@ class RowGroupReader:
             RateLimitError: If HTTP 429 Too Many Requests is encountered.
             CorruptParquetError: If reading or decoding the row group fails after exhausting retries.
         """
-        # 1. Check in-memory LRU cache
-        cached = self.memory_cache.get(file_url, rg_index, columns)
-        if cached is not None:
-            return cached
+        # 1. Check in-memory LRU cache and single-flight deduplication under _inflight_lock
+        cols_key = tuple(columns) if columns is not None else None
+        inflight_key = (file_url, rg_index, cols_key)
 
-        # 2. Check progressive disk saver if configured
-        if self.progressive_saver is not None:
-            cached_prog = self.progressive_saver.get(file_index, rg_index, columns)
-            if cached_prog is not None:
-                self.memory_cache.put(file_url, rg_index, cached_prog, columns)
-                return cached_prog
+        with self._inflight_lock:
+            cached = self.memory_cache.get(file_url, rg_index, columns)
+            if cached is not None:
+                return cached
+            inflight_entry = self._inflight_rgs.get(inflight_key)
+            if inflight_entry is None:
+                inflight_entry = _InflightRowGroup()
+                self._inflight_rgs[inflight_key] = inflight_entry
+                is_inflight_owner = True
+            else:
+                is_inflight_owner = False
 
-        # 3. Check disk cache if configured
-        if self.disk_cache is not None:
-            cached_disk = self.disk_cache.get(file_url, rg_index, columns)
-            if cached_disk is not None:
-                self.memory_cache.put(file_url, rg_index, cached_disk, columns)
-                return cached_disk
+        if not is_inflight_owner:
+            inflight_entry.event.wait()
+            if inflight_entry.error is not None:
+                raise inflight_entry.error
+            if inflight_entry.table is not None:
+                return inflight_entry.table
+            cached = self.memory_cache.get(file_url, rg_index, columns)
+            if cached is not None:
+                return cached
+            return self.read_row_group(file_url, rg_index, columns=columns, file_index=file_index)
 
-        # 4. Read from source with automatic retries on transient network/IO errors
-        is_remote = file_url.startswith(("http://", "https://"))
-        max_attempts = self.max_retries if is_remote else 1
-        last_error: Optional[Exception] = None
+        try:
+            # 2. Check progressive disk saver if configured
+            if self.progressive_saver is not None:
+                cached_prog = self.progressive_saver.get(file_index, rg_index, columns)
+                if cached_prog is not None:
+                    self.memory_cache.put(file_url, rg_index, cached_prog, columns)
+                    inflight_entry.table = cached_prog
+                    return cached_prog
 
-        for attempt in range(max_attempts):
-            try:
-                pf = self._get_parquet_file(file_url)
-                table = pf.read_row_group(rg_index, columns=list(columns) if columns else None)
-                break
-            except Exception as e:
-                last_error = e
-                # Evict the potentially severed/corrupted file handle from pool
-                self._evict_file(file_url)
-                if self.file_cache is not None:
-                    self.file_cache.evict(file_url)
-                is_rate_limit = "429" in str(e) or "too many requests" in str(e).lower()
-                if is_rate_limit:
-                    raise RateLimitError(file_url) from e
+            # 3. Check disk cache if configured
+            if self.disk_cache is not None:
+                cached_disk = self.disk_cache.get(file_url, rg_index, columns)
+                if cached_disk is not None:
+                    self.memory_cache.put(file_url, rg_index, cached_disk, columns)
+                    inflight_entry.table = cached_disk
+                    return cached_disk
 
-                if is_remote and attempt < max_attempts - 1 and "cannot schedule new futures" not in str(e).lower() and "_log_stats" not in str(e).lower():
-                    delay = min(self.max_retry_delay, self.retry_delay * (2 ** attempt))
-                    logger.warning(
-                        f"⚠️ Transient error reading row group {rg_index} from '{file_url}' "
-                        f"(attempt {attempt + 1}/{max_attempts}): {e}. "
-                        f"Resetting connection and retrying in {delay:.2f}s..."
-                    )
-                    # For payload/network stream errors, reset filesystem to establish fresh HTTP session
-                    self.reset_filesystem()
-                    time.sleep(delay)
-                else:
-                    raise CorruptParquetError(
-                        file_url,
-                        f"Failed reading row group {rg_index} after {attempt + 1} attempt(s): {e}",
-                    ) from e
-        else:
-            raise CorruptParquetError(
-                file_url,
-                f"Failed reading row group {rg_index} after exhausting {max_attempts} retries: {last_error}",
-            ) from last_error
+            # 4. Read from source with automatic retries on transient network/IO errors
+            is_remote = file_url.startswith(("http://", "https://"))
+            max_attempts = self.max_retries if is_remote else 1
+            last_error: Optional[Exception] = None
 
-        # Track row group consumption for FileCache
-        if self.file_cache is not None:
-            self._read_rgs_per_file[file_url].add(rg_index)
-            try:
-                pf_info = self._get_parquet_file(file_url)
-                if len(self._read_rgs_per_file[file_url]) >= pf_info.num_row_groups:
-                    self.file_cache.mark_consumed(file_url)
-            except Exception:
-                pass
+            for attempt in range(max_attempts):
+                try:
+                    pf = self._get_parquet_file(file_url)
+                    table = pf.read_row_group(rg_index, columns=list(columns) if columns else None)
+                    break
+                except Exception as e:
+                    last_error = e
+                    # Evict the potentially severed/corrupted file handle from pool
+                    self._evict_file(file_url)
+                    if self.file_cache is not None:
+                        self.file_cache.evict(file_url)
+                    is_rate_limit = "429" in str(e) or "too many requests" in str(e).lower()
+                    if is_rate_limit:
+                        raise RateLimitError(file_url) from e
 
-        # 5. Save to progressive disk saver if configured
-        if self.progressive_saver is not None:
-            self.progressive_saver.save(file_index, rg_index, table, columns)
+                    if is_remote and attempt < max_attempts - 1 and "cannot schedule new futures" not in str(e).lower() and "_log_stats" not in str(e).lower():
+                        delay = min(self.max_retry_delay, self.retry_delay * (2 ** attempt))
+                        logger.warning(
+                            f"⚠️ Transient error reading row group {rg_index} from '{file_url}' "
+                            f"(attempt {attempt + 1}/{max_attempts}): {e}. "
+                            f"Resetting connection and retrying in {delay:.2f}s..."
+                        )
+                        # For payload/network stream errors, reset filesystem to establish fresh HTTP session
+                        self.reset_filesystem()
+                        time.sleep(delay)
+                    else:
+                        raise CorruptParquetError(
+                            file_url,
+                            f"Failed reading row group {rg_index} after {attempt + 1} attempt(s): {e}",
+                        ) from e
+            else:
+                raise CorruptParquetError(
+                    file_url,
+                    f"Failed reading row group {rg_index} after exhausting {max_attempts} retries: {last_error}",
+                ) from last_error
 
-        # 6. Save to disk cache if configured
-        if self.disk_cache is not None:
-            self.disk_cache.put(file_url, rg_index, table, columns)
+            # Track row group consumption for FileCache
+            if self.file_cache is not None:
+                self._read_rgs_per_file[file_url].add(rg_index)
+                try:
+                    pf_info = self._get_parquet_file(file_url)
+                    if len(self._read_rgs_per_file[file_url]) >= pf_info.num_row_groups:
+                        self.file_cache.mark_consumed(file_url)
+                except Exception:
+                    pass
 
-        # 7. Save to memory cache
-        self.memory_cache.put(file_url, rg_index, table, columns)
+            # 6. Save to progressive disk saver if configured
+            if self.progressive_saver is not None:
+                self.progressive_saver.save(file_index, rg_index, table, columns)
 
-        return table
+            # 7. Save to disk cache if configured
+            if self.disk_cache is not None:
+                self.disk_cache.put(file_url, rg_index, table, columns)
 
-        # 5. Save to progressive disk saver if configured
-        if self.progressive_saver is not None:
-            self.progressive_saver.save(file_index, rg_index, table, columns)
+            # 8. Save to memory cache
+            self.memory_cache.put(file_url, rg_index, table, columns)
 
-        # 6. Save to disk cache if configured
-        if self.disk_cache is not None:
-            self.disk_cache.put(file_url, rg_index, table, columns)
-
-        # 7. Save to memory cache
-        self.memory_cache.put(file_url, rg_index, table, columns)
-
-        return table
+            inflight_entry.table = table
+            return table
+        except BaseException as exc:
+            inflight_entry.error = exc
+            raise
+        finally:
+            with self._inflight_lock:
+                self._inflight_rgs.pop(inflight_key, None)
+            inflight_entry.event.set()
 
     def close(self) -> None:
         """Close all open file handles and clear caches."""
@@ -395,6 +428,8 @@ class RowGroupReader:
     def __getstate__(self) -> Dict[str, Any]:
         state = self.__dict__.copy()
         state.pop("_lock", None)
+        state.pop("_inflight_lock", None)
+        state.pop("_inflight_rgs", None)
         state.pop("_local", None)
         state.pop("_all_active_fps", None)
         state.pop("_open_files", None)
@@ -406,6 +441,8 @@ class RowGroupReader:
         self.__dict__.update(state)
         self._local = threading.local()
         self._lock = threading.Lock()
+        self._inflight_lock = threading.Lock()
+        self._inflight_rgs = {}
         self._all_active_fps = set()
 
 
