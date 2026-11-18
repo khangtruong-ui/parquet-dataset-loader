@@ -244,5 +244,57 @@ def test_row_group_reader_corrupt_cached_file_eviction(temp_dir: str) -> None:
     cache.close()
 
 
+def test_row_group_reader_single_flight_dedup(temp_dir: str) -> None:
+    """Verify concurrent threads requesting the same uncached row group only read it once."""
+    import concurrent.futures
+    import threading
+    import time
+
+    f1 = create_sample_parquet_file(
+        os.path.join(temp_dir, "single_flight.parquet"),
+        num_rows=30,
+        row_group_size=30,
+    )
+    reader = RowGroupReader(memory_cache=RowGroupMemoryCache(max_entries=2))
+
+    read_calls = 0
+    count_lock = threading.Lock()
+    orig_get_pf = reader._get_parquet_file
+
+    class SlowParquetFileProxy:
+        def __init__(self, pf):
+            self._pf = pf
+
+        def read_row_group(self, rg_index, columns=None):
+            nonlocal read_calls
+            with count_lock:
+                read_calls += 1
+            time.sleep(0.05)
+            return self._pf.read_row_group(rg_index, columns=columns)
+
+        @property
+        def num_row_groups(self):
+            return self._pf.num_row_groups
+
+    reader._get_parquet_file = lambda url, max_attempts=None: SlowParquetFileProxy(orig_get_pf(url, max_attempts))
+
+    try:
+        barrier = threading.Barrier(8)
+
+        def worker():
+            barrier.wait(timeout=5.0)
+            return reader.read_row_group(f1, 0)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(worker) for _ in range(8)]
+            tables = [f.result(timeout=5.0) for f in futures]
+
+        assert len(tables) == 8
+        assert all(t.num_rows == 30 for t in tables)
+        assert read_calls == 1, f"Expected 1 underlying read due to single-flight, got {read_calls}"
+    finally:
+        reader.close()
+
+
 
 

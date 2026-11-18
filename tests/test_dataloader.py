@@ -561,5 +561,41 @@ def test_dataloader_timeout_disabled_no_timeout() -> None:
     assert len(batches) == 2
 
 
+def test_dataloader_row_group_prefetch_and_early_exit(temp_dir: str) -> None:
+    """Verify background row-group lookahead prefetcher yields all rows and exits cleanly on early break."""
+    from parquet_dataset_loader import load_dataset
+    from tests.conftest import create_sample_parquet_file
+
+    f1 = create_sample_parquet_file(
+        os.path.join(temp_dir, "prefetch_test.parquet"),
+        num_rows=80,
+        row_group_size=20,
+    )
+    ds = load_dataset(f1, split="test", streaming=True, max_cached_row_groups=4)
+
+    loader = DataLoader(
+        ds,
+        batch_size=5,
+        shuffle=True,
+        num_workers=2,
+        worker_type="thread",
+        prefetch_factor=2,
+        seed=42,
+    )
+
+    try:
+        seen_ids = []
+        for batch in loader:
+            seen_ids.extend(batch["id"].tolist() if hasattr(batch["id"], "tolist") else list(batch["id"]))
+        assert sorted(seen_ids) == list(range(80))
+
+        # Early break should shut down prefetcher and workers without hanging
+        for idx, _ in enumerate(loader):
+            if idx == 1:
+                break
+    finally:
+        ds.close()
+
+
 
 
